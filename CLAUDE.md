@@ -718,18 +718,35 @@ following, not a checklist to keep exhausting. Two concrete starting points
 for whoever picks this up next, both cheap (one-line change + 40-game
 sanity gate + SPRT) and neither yet tried:
 
-- **`CHECK_EXT_BUDGET` tuning: tried 6, confirmed worse than 16, keep 16.**
-  SPRT vs. the `CHECK_EXT_BUDGET=16` baseline at `elo0=-5 elo1=5`: after
-  373 games the estimate had stabilized around **-23 to -27 Elo** (three
-  consecutive checkpoints all in that band, error bars tightening to
-  ±27–29) — a clear, consistent negative trend, stopped before full LLR
-  convergence since the direction was no longer in doubt. A tighter check-
-  extension budget costs more in missed tactics than it saves in nodes.
-  **Untried, still worth a shot:** a *larger* budget (e.g. 24) — the
-  6-vs-16 result says "don't go tighter," it doesn't say 16 is the ceiling
-  in the other direction. Also untried: the `1.3x` instability stretch
-  factor and `hard_limit = min(myTime/2, soft_limit*4)` formula in time
-  management — both still just reasonable guesses.
+- **`CHECK_EXT_BUDGET` tuning: tried 6 and 24, both inconclusive-to-worse,
+  keeping 16.**
+  - `=6` vs. the `=16` baseline (`elo0=-5 elo1=5`): after 373 games the
+    estimate had stabilized around **-23 to -27 Elo**, three consecutive
+    checkpoints all in that band, tightening error bars — a clear,
+    consistent negative trend. Stopped before full LLR convergence since
+    the direction was no longer in doubt. A tighter budget costs more in
+    missed tactics than it saves in nodes.
+  - `=24` vs. `=16` (`elo0=0 elo1=10`): **cautionary tale, read before
+    trusting any mid-run SPRT trend on a small effect.** At ~700–1100
+    games this looked like a real win (+9 to +17 Elo, tightening error
+    bars, briefly LLR 25–34% of the way to the H1 bound) — tempting to
+    stop early and adopt. Kept running instead. By ~1660 games the
+    estimate had decayed to **+3.82 ± 12.05 Elo, LLR ≈ 0** (bouncing
+    between -0.07 and +0.26) — a small, noisy effect indistinguishable
+    from zero, not the double-digit win it looked like 500 games earlier.
+    Stopped and reverted to `=16`. **Lesson: for a small true effect size,
+    a promising-looking trend at 700-1100 games is not evidence — SPRT
+    error bars shrink slower than they look, and an estimate that hasn't
+    yet crossed the bound can still drift a long way before it does (or
+    doesn't). Don't adopt a change on a mid-run trend; wait for LLR to
+    actually cross a bound, or accept that games in the low thousands
+    weren't enough for this effect size and the change is genuinely
+    borderline.** If revisited, either commit to running until LLR
+    actually resolves (could be several thousand more games), or accept
+    `16` as good-enough and spend the compute elsewhere.
+  - Also untried: the `1.3x` instability stretch factor and
+    `hard_limit = min(myTime/2, soft_limit*4)` formula in time management
+    — both still just reasonable guesses, not yet SPRT-tuned.
 - **DEAD — aspiration window fallback rate.** Instrumented directly
   (temporary counters, since removed): zero full-width fallbacks fired
   across 45 aspiration-window iterations spanning 7 diverse positions
