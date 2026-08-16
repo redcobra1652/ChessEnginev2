@@ -1905,14 +1905,19 @@ static int64_t elapsed_ms() {
 // poll and when search() finally returned. A large gap localizes the
 // overrun to an unpolled stretch of code; a small gap means the overrun is
 // elsewhere (allocation, output, or the budget itself).
-static int64_t g_last_poll_ms = 0;
+static int64_t g_last_poll_ms = 0;      // elapsed_ms() at the most recent poll
+static int64_t g_prev_poll_ms = 0;      // elapsed_ms() at the poll before that
+static int64_t g_max_poll_gap_ms = 0;   // largest observed gap between consecutive polls this search
 static bool g_time_debug = false;  // set once in main() from NNUE_TIME_DEBUG env var
 
 static bool out_of_time() {
     if (g_stop) return true;
     if (g_node_limit >= 0 && g_nodes >= g_node_limit) return true;
     if (g_time_limit_ms >= 0 && (g_nodes & 4095) == 0) {
+        g_prev_poll_ms = g_last_poll_ms;
         g_last_poll_ms = elapsed_ms();
+        int64_t gap = g_last_poll_ms - g_prev_poll_ms;
+        if (gap > g_max_poll_gap_ms) g_max_poll_gap_ms = gap;
         return g_last_poll_ms >= g_time_limit_ms;
     }
     return false;
@@ -2233,7 +2238,10 @@ static int alpha_beta(Board &board, Accumulator &acc,
                 ss->movingPiece  = pc_piece;
                 Move cp[MAX_PLY]; int cpl = 0;
                 int pc_val = -quiescence(board, acc, -prob_cut_beta, -prob_cut_beta + 1, ss + 1, ply + 1);
-                if (pc_val >= prob_cut_beta)
+                // Same ungated-re-search hazard as the LMR re-search below:
+                // don't chase an aborted qsearch's score with a fresh,
+                // node-count-unaligned alpha_beta call.
+                if (pc_val >= prob_cut_beta && !out_of_time())
                     pc_val = -alpha_beta(board, acc, depth - 4, -prob_cut_beta, -prob_cut_beta + 1,
                                          ply + 1, false, !cut_node, cp, cpl, ss + 1);
                 board.undo_move(m);
@@ -2423,8 +2431,18 @@ static int alpha_beta(Board &board, Accumulator &acc,
             }
             score = -alpha_beta(board, acc, depth - 1 - r + ext, -alpha - 1, -alpha,
                                 ply + 1, true, true, child_pv, child_pv_len, ss + 1);
-            // Re-search at full depth if LMR failed high
-            if (score > alpha && r > 0) {
+            // Re-search at full depth if LMR failed high.
+            // Gated on !out_of_time(): a "fail high" here can be a spurious
+            // artifact of the reduced-depth search itself having been aborted
+            // deep inside by a timeout (it returns its local alpha bound,
+            // which after negation across plies can look like score > alpha
+            // with no real information behind it). Without this guard, that
+            // triggers a brand-new *full-depth* search that starts at a fresh
+            // node count not aligned to the polling boundary, so it runs
+            // unchecked for up to ~4096 nodes before the clock is read again
+            // — measured as the dominant cause of the CLAUDE.md-documented
+            // time-overrun bug (SPRT losses on time despite generous margin).
+            if (score > alpha && r > 0 && !out_of_time()) {
                 child_pv_len = 0;
                 score = -alpha_beta(board, acc, depth - 1 + ext, -alpha - 1, -alpha,
                                     ply + 1, true, !cut_node, child_pv, child_pv_len, ss + 1);
@@ -2432,7 +2450,9 @@ static int alpha_beta(Board &board, Accumulator &acc,
                 int bonus = (score > alpha) ? stat_bonus(depth - 1) : -stat_bonus(depth - 1);
                 update_continuation_histories(ss, piece, to, bonus);
             }
-            if (is_pv && score > alpha && score < beta) {
+            // Same rationale as above: don't launch an ungated full-window
+            // re-search on a score that may only reflect an aborted subtree.
+            if (is_pv && score > alpha && score < beta && !out_of_time()) {
                 child_pv_len = 0;
                 score = -alpha_beta(board, acc, depth - 1 + ext, -beta, -alpha,
                                     ply + 1, true, false, child_pv, child_pv_len, ss + 1);
@@ -2537,6 +2557,9 @@ struct Engine {
         g_start_time    = Clock::now();
         g_time_limit_ms = movetime_ms;
         g_nodes         = 0;
+        g_last_poll_ms  = 0;
+        g_prev_poll_ms  = 0;
+        g_max_poll_gap_ms = 0;
 
         search_init();
         acc.reset(board);
@@ -2757,11 +2780,14 @@ int main() {
                 int64_t print_overhead_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     t_after_print - t_after_search).count();
                 int64_t unpolled_gap_ms = search_wall_ms - g_last_poll_ms;
+                int64_t final_poll_interval_ms = g_last_poll_ms - g_prev_poll_ms;
                 std::cerr << "[TIMEDBG] budget=" << movetime
                           << " search_wall=" << search_wall_ms
                           << " recv_to_return=" << recv_to_return_ms
                           << " print_overhead=" << print_overhead_ms
                           << " last_poll_to_return_gap=" << unpolled_gap_ms
+                          << " final_poll_interval=" << final_poll_interval_ms
+                          << " max_poll_gap=" << g_max_poll_gap_ms
                           << " overrun=" << (search_wall_ms - movetime) << "\n" << std::flush;
             }
 
