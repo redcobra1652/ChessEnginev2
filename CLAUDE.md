@@ -643,13 +643,18 @@ below to reflect everything found this pass.
    `g_capture_history`, `g_countermoves`, `g_killers`, and now
    `g_pawn_corrhist`) for thread safety — a rewrite, not a patch. Do this
    deliberately, and re-verify TT/history correctness under contention.
-6. **Improve time management.** Current `go` handling
-   (`myTime/movestogo + myInc*0.8`, `movestogo` defaulting to 30) has no
-   soft/hard limit split and no "extend if the best move is unstable" logic.
-   Now directly measurable via the SPRT harness at a real time control
-   (item 1 is done) — worth trying next after multithreading, or before it
-   if multithreading is deferred, since it's a much smaller, faster-to-test
-   change.
+6. **DONE — soft/hard time-limit split with best-move-instability
+   extension.** `soft_limit` keeps the old `myTime/movestogo + myInc*0.8`
+   formula as the "normal" allocation; `hard_limit = min(myTime/2,
+   soft_limit*4)` is a generous cap. Iterative deepening won't start a new
+   depth once `soft_limit` is used up, unless the best move changed between
+   consecutive completed iterations at depth ≥5, in which case the
+   effective soft limit stretches 1.3x per instability event (capped at
+   `hard_limit`). Only active for wtime/btime-derived budgets — fixed
+   `go movetime`/`go depth`/`go infinite` unaffected. **SPRT-verified:
+   +53.28 ± 22.74 Elo vs. the corrhist+checkext baseline, 598 games,
+   `elo0=0 elo1=10`, H1 accepted, LOS 100%, zero time losses.**
+   `nnue_engine_baseline` now holds this state.
 7. **Staged move generation (MovePicker-style).** Try the TT move first
    without generating anything; only generate captures, then quiets, if
    needed. Real node-count lever, but requires promoting the TT move's
