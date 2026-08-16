@@ -7,19 +7,22 @@ for evaluation, paired with a Stockfish-style alpha-beta search. Trained via
 Lichess cloud-eval labels at depth ≥20). Benchmarked/tournament-tested against
 Stockfish via `tournament.py` and `bench.py`.
 
-**Current status: ~2683 Elo ± 17 (measured via `tournament.py` against
-Stockfish@2750, 100 games, after fixing a `ucinewgame`-per-game bug in the
-harness — see "Session follow-up" below), consistent with the earlier
-~2600 estimate. Goal: ~3000 Elo, i.e. roughly 320 Elo remaining. This is a
-stale, pre-SPRT number — item 1 (the time-overrun bug that made the SPRT
-harness untrustworthy) is now **fixed and verified**, see "RESOLVED — the
-time-management overrun bug" below, so game-based SPRT is now the correct
-way to measure everything from here on, not `tournament.py`. Read
-"Session follow-up: harness fix, code audit, and NNUE scale diagnostic"
-below before doing anything else — it supersedes some of this document's
-earlier conclusions (notably: cross-engine depth comparisons are invalid,
-see that section) and lists concrete, verified next actions with their
-evidence.**
+**Current status: the ~2683 Elo figure (measured via `tournament.py` against
+Stockfish@2750) is stale and known to be inflated — it was measured on a
+binary with the time-overrun bug (see below), which was quietly playing at
+~1.1x its allotted time on nearly every move. There is no fresh
+Stockfish-anchored Elo number yet. What IS known, from game-based SPRT (the
+trustworthy way to measure from here on, not `tournament.py`): the current
+`nnue_engine_baseline` — timing bug fixed, pawn correction history added,
+check extension gated — beats the honest pre-those-changes engine by
+**+159.65 ± 41.24 Elo** (256 games, `elo0=0 elo1=10`, H1 accepted, LOS
+100%). Read "Prioritized next steps toward ~3000 Elo" for what's done vs.
+open, and "Operational lessons from this session" before running any more
+SPRTs — both are near the bottom of this document. Getting a fresh
+Stockfish-anchored number (`tournament.py` or a Stockfish-opponent SPRT) is
+worth doing soon to re-anchor the ~3000 Elo goal against a real external
+reference, since the internal +159.65 Elo gain is relative to an
+already-stale baseline, not to Stockfish.**
 
 ## Baseline before this work
 
@@ -596,44 +599,57 @@ below to reflect everything found this pass.
    re-search, ProbCut re-search) could launch an expensive, ungated second
    search on a score that was itself an artifact of an already-timed-out
    subtree. Fixed by gating each on `!out_of_time()`. Verified clean (zero
-   time losses) both at a generous `st=2`/`concurrency=1` setup and at the
-   actual SPRT time control (`tc=8+0.08`, `concurrency=4`). A regression
-   check (post-fix vs. pre-fix, `elo0=-5 elo1=5`) was launched to confirm
-   the fix itself is Elo-neutral-or-better — check its result before
-   treating this as fully closed, but nothing below is blocked on it.
-   `nnue_engine_baseline` now holds a copy of the **post-fix** binary — use
-   that as the SPRT opponent for every change below, not a pre-fix binary
-   (an easy mistake: CLAUDE.md's own example SPRT command says `cp
-   nnue_engine nnue_engine_baseline` *before* making a change — do that
-   fresh from the current `nnue_engine`, don't reuse an old copy).
-2. **Use the SPRT harness (already built — `fastchess` + `openings.epd`,
-   see above) for every change below.** This is not optional: correction
-   history and check-extension gating are each individually in the 10–30
-   Elo band, and the old `tournament.py`-based ±17 nominal margin was
-   optimistic besides (games share openings from `startpos`, so they're
-   correlated).
-3. **Gate the check extension** (`nnue_engine.cpp:2365`) with an SEE check
-   and/or a per-line extension budget, instead of unconditional +1 for every
-   checking move. Confirmed real via node-count testing (23–57% fewer nodes
-   in 3 of 4 cases) but needs the SPRT harness (item 1) to know if it costs
-   or gains Elo — `complex_mg` depth 14 got worse without it, so this is not
-   a free win.
-4. **Add correction history.** Confirmed absent; ~20–30 Elo in Stockfish's
-   own testing. Needs the SPRT harness to verify on this codebase too, but
-   this is the most likely single small win on the list.
-5. **Multithreading (Lazy SMP).** The one item on this list big enough to
-   measure with the *existing* 100-game harness (real multithreading gains
-   are typically well above the noise floor, unlike the two items above).
-   Requires redesigning every global (`g_tt`, `g_main_history`,
-   `g_cont_history`, `g_capture_history`, `g_countermoves`, `g_killers`) for
-   thread safety — a rewrite, not a patch. Do this deliberately, and
-   re-verify TT/history correctness under contention.
-6. **Improve time management** once testing moves to real per-move time
-   budgets (SPRT harness territory). Current `go` handling
+   time losses) at the actual SPRT time control under real contention
+   (`tc=8+0.08`, `concurrency=4`, 8126+ sampled moves). The planned
+   post-fix-vs-pre-fix regression check was abandoned as methodologically
+   invalid (see "Operational lessons" above) — don't re-attempt it.
+2. **DONE — correction history added, fixed, and SPRT-verified.** First
+   attempt was badly broken (two independent bugs — a missing grain divisor
+   that let a saturated correction swing eval by over a pawn, and a
+   `best_move`-vs-`alpha_raising_move` gating bug that made the table only
+   ever ratchet upward) and lost ~90% of games in a 40-game sanity check
+   before either bug reached a real SPRT. See the "Fix correction history"
+   commit for both root causes. Single-component (pawn-structure-only), see
+   the code comment at `g_pawn_corrhist`'s declaration for the design.
+3. **DONE — check extension gated with an SEE check and a per-line budget
+   (`CHECK_EXT_BUDGET=16`).** Previously unconditional +1 for every checking
+   move, no SEE gate, no budget — confirmed via node-count testing to cost
+   23–57% extra nodes at fixed depth in 3 of 4 positions (CLAUDE.md,
+   earlier session).
+4. **Items 2+3 combined, SPRT-verified together (not isolated — see below):
+   +159.65 ± 41.24 Elo vs. the honest (post-timing-fix) baseline, LOS
+   100%, `elo0=0 elo1=10` — H1 accepted at 256 games, LLR crossed the bound
+   with more than 3x the required margin.** This is a very large result —
+   far above the ~20–30 Elo originally estimated for correction history
+   alone — most likely explained by the check-extension fix mattering far
+   more than expected (the 23–57% node-count savings measured earlier
+   translating directly into search depth/quality at a fixed time budget),
+   with correction history adding on top. **Caveat: this SPRT tested the two
+   changes combined, not in isolation** (they landed as sequential commits
+   on the same tree before this was noticed) — if precise per-feature
+   attribution matters later, that requires a follow-up SPRT isolating one
+   change from the other (e.g., build a check-extension-only candidate from
+   `git show <timing-fix-commit>:nnue_engine.cpp` plus a cherry-picked
+   check-extension diff). Not done this session — the combined result was
+   decisive enough that isolating attribution wasn't the priority; revisit
+   only if a future change's SPRT result looks surprising and disentangling
+   past changes would help explain why.
+   **`nnue_engine_baseline` now holds this combined, winning state** —
+   every SPRT below should compare against it, and should be re-copied
+   fresh from `nnue_engine` immediately after the *next* change lands (see
+   "Operational lessons" above for why: never reuse a stale baseline copy).
+5. **Multithreading (Lazy SMP).** Still the next big lever. Requires
+   redesigning every global (`g_tt`, `g_main_history`, `g_cont_history`,
+   `g_capture_history`, `g_countermoves`, `g_killers`, and now
+   `g_pawn_corrhist`) for thread safety — a rewrite, not a patch. Do this
+   deliberately, and re-verify TT/history correctness under contention.
+6. **Improve time management.** Current `go` handling
    (`myTime/movestogo + myInc*0.8`, `movestogo` defaulting to 30) has no
    soft/hard limit split and no "extend if the best move is unstable" logic.
-   Not yet exercised by any current test (`tournament.py` uses fixed depth
-   for this engine), so not measurable until item 1 is in place.
+   Now directly measurable via the SPRT harness at a real time control
+   (item 1 is done) — worth trying next after multithreading, or before it
+   if multithreading is deferred, since it's a much smaller, faster-to-test
+   change.
 7. **Staged move generation (MovePicker-style).** Try the TT move first
    without generating anything; only generate captures, then quiets, if
    needed. Real node-count lever, but requires promoting the TT move's
