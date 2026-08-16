@@ -1,0 +1,15 @@
+positions.bin
+positions.bin.gz
+checkpoints/*.pt
+stockfish/stockfish-macos-m1-apple-silicon
+fastchess_src/
+games/
+nnue_engine
+nnue_engine_baseline
+fastchess
+profile.txt
+net_eval_diagnostic_results.csv
+__pycache__/
+*.pgn
+sprt_result.pgn
+.DS_Store
