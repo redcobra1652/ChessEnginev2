@@ -10,7 +10,11 @@ Stockfish via `tournament.py` and `bench.py`.
 **Current status: ~2683 Elo ± 17 (measured via `tournament.py` against
 Stockfish@2750, 100 games, after fixing a `ucinewgame`-per-game bug in the
 harness — see "Session follow-up" below), consistent with the earlier
-~2600 estimate. Goal: ~3000 Elo, i.e. roughly 320 Elo remaining. Read
+~2600 estimate. Goal: ~3000 Elo, i.e. roughly 320 Elo remaining. This is a
+stale, pre-SPRT number — item 1 (the time-overrun bug that made the SPRT
+harness untrustworthy) is now **fixed and verified**, see "RESOLVED — the
+time-management overrun bug" below, so game-based SPRT is now the correct
+way to measure everything from here on, not `tournament.py`. Read
 "Session follow-up: harness fix, code audit, and NNUE scale diagnostic"
 below before doing anything else — it supersedes some of this document's
 earlier conclusions (notably: cross-engine depth comparisons are invalid,
@@ -444,60 +448,90 @@ Set `-concurrency` conservatively (well under physical core count) given the
 timing issue below — concurrency contention makes the overrun bug worse, not
 just slower.
 
-### CRITICAL — a real, only partially-fixed time-management bug; fix before trusting any SPRT result
+### RESOLVED — the time-management overrun bug is root-caused and fixed
+
+(Formerly "CRITICAL — a real, only partially-fixed time-management bug."
+This section is history for context; skip to "Prioritized next steps" for
+what's still open.)
 
 Building the harness immediately surfaced a bug that would otherwise have
 silently contaminated every SPRT run with spurious time losses unrelated to
-move quality:
+move quality. Two sub-bugs, found and fixed across two sessions:
 
-**Found and fixed this session:** `quiescence()` never called
-`out_of_time()` (see "Bugs found" above, which has since been upgraded from
-"unconfirmed" to **confirmed** — this is no longer a hypothesis). Under
-`tournament.py`'s fixed-depth testing this was invisible; under `fastchess`'s
-strict per-move time enforcement it caused real, repeated "loses on time"
-forfeits — including at least one game that did not produce a move within a
-5-minute wall-clock budget at `st=0.2`. Fix applied at
-`nnue_engine.cpp:1926` (mirrors `alpha_beta`'s existing
-`out_of_time()`-then-`return alpha` pattern). Rebuilt and verified via a
-standalone test: 49/49 direct `go movetime 2000` calls (one per opening-book
-position, no `fastchess`, no concurrency) returned `bestmove` within
-2.00–2.06s — clean, no overruns, no stalls.
+**Sub-bug 1 (earlier session): `quiescence()` never called `out_of_time()`.**
+Under `tournament.py`'s fixed-depth testing this was invisible; under
+`fastchess`'s strict per-move time enforcement it caused real, repeated
+"loses on time" forfeits. Fixed at `nnue_engine.cpp:1926` (mirrors
+`alpha_beta`'s existing `out_of_time()`-then-`return alpha` pattern).
 
-**Still unresolved — confirmed real, not a testing artifact:** even after
-the fix above, with a *generous* budget (`st=2` = 2000ms, `timemargin=100`,
-`-concurrency 1`, so no CPU contention), a real game under `fastchess`
-produced `White loses on time (143ms overrun)` on game 1. This rules out
-"just a tight budget" or "just concurrency contention" as the explanation —
-those were tested and ruled out separately (concurrency=1, large margin).
-**The standalone 49-position test above did not reproduce this**, which is
-itself informative: the overrun appears to require a position reached
-*through actual play* (deeper/more complex middlegame, or a search that has
-accumulated real TT/history content across several moves in the same game),
-not a fresh book-depth position probed in isolation.
+**Sub-bug 2 (this session, the actual root cause of the residual 143–165ms
+overruns): three re-search call sites chained a second, more expensive
+search onto the result of a first one without ever checking the clock in
+between.** The exact sites CLAUDE.md flagged as the likely culprit before
+this session started ("check the aspiration-window retry loop and the LMR
+fail-high re-search path") were exactly right:
 
-**This must be root-caused and fixed before any SPRT result is trustworthy**
-— a 100–150ms overrun on a several-second budget is large enough to cause
-real spurious losses, and SPRT is specifically vulnerable to a systematic
-bias like this (it looks exactly like "the engine playing worse," not like
-noise, because it's a consistent, repeatable time forfeit, not a random
-swing). Suggested starting point for whoever picks this up: this is not
-"more guessing about which heuristic to disable" — instrument directly.
-Add wall-clock timestamps (a) immediately when the `go` command is parsed,
-(b) immediately before `Engine::search()` returns, and (c) immediately
-before `std::cout << "bestmove ..."` prints, all to `std::cerr`. That
-isolates whether the overrun is happening *inside* the polling loop (meaning
-the 4096-node polling granularity, or one specific unguarded code path
-between polls, is insufficient — check the aspiration-window retry loop and
-the LMR fail-high re-search path for a chain of calls that could run long
-between two poll points) versus *after* `search()` already returned (meaning
-something in output/UCI-loop overhead, not the search itself, is the
-culprit). Reproduce with: `./fastchess -engine cmd=./nnue_engine
-option.NNFile=$(pwd)/checkpoints/model.nnue -engine cmd=./nnue_engine
-option.NNFile=$(pwd)/checkpoints/model.nnue -each proto=uci st=2
-option.Hash=64 timemargin=100 -openings file=openings.epd format=epd
-order=random -rounds 10 -games 2 -repeat -concurrency 1 -maxmoves 80` and
-watch for `loses on time` in the output — reproduced within the first game
-in testing, so it shouldn't take long to catch again.
+- LMR fail-high re-search (full-depth, `nnue_engine.cpp` — was ungated)
+- The PV re-search when a null-window search lands inside `(alpha, beta)`
+  (was ungated)
+- ProbCut's `alpha_beta` re-search fired after a qsearch probe crosses
+  `prob_cut_beta` (was ungated)
+
+Mechanism: `out_of_time()`'s node-count gate (`g_nodes & 4095 == 0`) is
+checked at every `alpha_beta`/`quiescence` *function entry*, so in isolation
+it's tight — empirically ~2–4ms between consecutive real polls, confirmed by
+instrumentation (see below). But when the *first* (reduced-depth or
+narrow-window) search in one of the three chains above is itself aborted by
+a timeout deep inside its own recursion, it returns its local `alpha` bound.
+After negation across several plies of differing alpha/beta windows, that
+can look exactly like a genuine fail-high or a real PV-window result — with
+no real search behind it. None of the three sites checked `out_of_time()`
+before trusting that score and launching the second, more expensive search.
+That second search is a *fresh* function call, so it starts at a node count
+that just moved one past a 4096-boundary — meaning the next real clock check
+doesn't happen until the count organically reaches the *following* boundary,
+up to ~4096 nodes later. Nested plies can each hit this same gap
+independently and compound, which is why observed overruns were variable
+(5–165ms) rather than a fixed amount.
+
+**Fix:** gate all three re-search call sites on `!out_of_time()` — if time is
+already up, skip the more expensive re-search and use the
+already-computed (if aborted) score as-is; the existing post-move
+`out_of_time()` check (`nnue_engine.cpp:2451`-ish, after `undo_move`) still
+catches it correctly from there.
+
+**Diagnostic instrumentation added** (kept in the codebase, off by default):
+set env var `NNUE_TIME_DEBUG=1` to make the engine print one `[TIMEDBG]`
+line per move to stderr — `budget`, `search_wall`, `overrun`, plus internal
+poll-gap fields (`last_poll_to_return_gap`, `final_poll_interval`,
+`max_poll_gap`) that were used to localize the bug and can be reused if a
+similar issue ever resurfaces. This is purely additive — zero behavior
+change when the env var is unset (confirmed: it gates every stderr print in
+the `go` handler and `main()`).
+
+**Verified, in increasing order of realism:**
+
+1. `st=2` (2000ms/move), `timemargin=100`, `-concurrency 1`: before the fix,
+   overrun was 5–165ms on *nearly every move* (617–2770 samples measured
+   across several runs); after the fix, 12 full games / 2770 samples showed
+   overrun capped at 0–4ms (one 24ms outlier), **zero time losses** (was:
+   reproduced within the first game, consistently).
+2. `tc=8+0.08` (the actual SPRT time control) with `-concurrency 4`
+   (realistic contention, not the artificially clean `concurrency=1` case):
+   60/60 games completed cleanly, 8126 samples, overrun essentially 0–2ms
+   with a handful up to 31ms, **zero time losses**.
+
+Root cause confirmed, fix verified under both an artificially generous
+setup and the actual conditions a real SPRT run will use. **Every prior
+SPRT-blocking concern in this document is now resolved** — proceed with
+game-based A/B testing for the remaining prioritized items below.
+
+A **regression check (post-fix vs. pre-fix engine, same net, `elo0=-5
+elo1=5`) is running via the SPRT harness to confirm the fix itself didn't
+cost playing strength** (skipping a re-search only when time was already up
+should be neutral-to-positive, but wasn't measured before this note was
+written — check the harness output / `sprt_result.pgn` for the resolved
+verdict before treating this as fully closed).
 
 ## Prioritized next steps toward ~3000 Elo
 
@@ -507,12 +541,22 @@ matter more than the depth-vs-time mismatch, and re-measurement landed at
 2683±17, close to the original ~2600 estimate. Items are renumbered/updated
 below to reflect everything found this pass.
 
-1. **Fix the remaining time-management overrun bug — see "SPRT harness"
-   section above.** This is now step 0 in practice: the harness itself is
-   already built and working, but this bug makes every result from it
-   untrustworthy until fixed (spurious time losses look exactly like a real
-   regression to SPRT, not like noise). Nothing below this is decidable
-   until it's resolved.
+1. **DONE — the time-management overrun bug is fixed and verified.** See
+   "RESOLVED — the time-management overrun bug is root-caused and fixed"
+   above. Root cause: three re-search call sites (LMR fail-high, PV
+   re-search, ProbCut re-search) could launch an expensive, ungated second
+   search on a score that was itself an artifact of an already-timed-out
+   subtree. Fixed by gating each on `!out_of_time()`. Verified clean (zero
+   time losses) both at a generous `st=2`/`concurrency=1` setup and at the
+   actual SPRT time control (`tc=8+0.08`, `concurrency=4`). A regression
+   check (post-fix vs. pre-fix, `elo0=-5 elo1=5`) was launched to confirm
+   the fix itself is Elo-neutral-or-better — check its result before
+   treating this as fully closed, but nothing below is blocked on it.
+   `nnue_engine_baseline` now holds a copy of the **post-fix** binary — use
+   that as the SPRT opponent for every change below, not a pre-fix binary
+   (an easy mistake: CLAUDE.md's own example SPRT command says `cp
+   nnue_engine nnue_engine_baseline` *before* making a change — do that
+   fresh from the current `nnue_engine`, don't reuse an old copy).
 2. **Use the SPRT harness (already built — `fastchess` + `openings.epd`,
    see above) for every change below.** This is not optional: correction
    history and check-extension gating are each individually in the 10–30
