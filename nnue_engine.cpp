@@ -46,7 +46,11 @@
  *   FT_SCALE  = 127   (FT activations ∈ [0, 127])
  *   L1_SCALE  = 64
  *   L2_SCALE  = 64
- *   OUT_SCALE = 600
+ *   OUT_SCALE = 0.6   (NOT 600 — see serialize.py's OUT_SCALE comment: the
+ *                      output layer's weights run an order of magnitude
+ *                      larger than the other layers' because its inputs are
+ *                      bounded to [0,1] by clipped_relu. 600 clipped ~97% of
+ *                      the output layer to the int8 boundary.)
  */
 
 #include <algorithm>
@@ -93,7 +97,7 @@ static constexpr int N_PIECE_TYPES = 10;
 static constexpr int FT_SCALE    = 127;
 static constexpr int L1_SCALE    = 64;
 static constexpr int L2_SCALE    = 64;
-static constexpr int OUT_SCALE   = 600;
+static constexpr double OUT_SCALE = 0.6;  // see the comment above and in serialize.py
 
 // Search constants
 static constexpr int INF         = 1'000'000;
@@ -1535,7 +1539,11 @@ static int nnue_eval(const AccEntry &acc, bool stm_white, int bucket) {
     int32_t score = W.out_b[bucket];
     for (int i = 0; i < L2_SIZE; i++) score += (int32_t)W.out_w[bucket][i] * (int32_t)l2[i];
 #endif
-    return score / OUT_SCALE;  // centipawns
+    // Descale by L2_SCALE*OUT_SCALE: the weighted sum above carries both
+    // L2_SCALE (from the incoming l2[] activations, themselves scaled by
+    // L2_SCALE) and OUT_SCALE (from the output weights) — matching
+    // serialize.py's out-bias scale (see its quantise_out()).
+    return (int)std::lround(score / (L2_SCALE * OUT_SCALE));  // centipawns
 }
 
 // ─────────────────────────── .nnue loader ──────────────────────────────────

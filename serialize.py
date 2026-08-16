@@ -26,9 +26,12 @@ Quantisation scales (matching a fixed-point integer engine):
 
   Layer bias scales encode the full accumulation path so the engine can use
   integer dot products without per-layer rescaling:
-    l1 bias scale = FT_SCALE * L1_SCALE   (FT output is in [0, FT_SCALE])
-    l2 bias scale = L1_SCALE * L2_SCALE   (L1 output is in [0, L1_SCALE])
-    out bias scale = OUT_SCALE             (L2 output is in [0, L2_SCALE])
+    l1 bias scale  = FT_SCALE * L1_SCALE   (FT output is in [0, FT_SCALE])
+    l2 bias scale  = L1_SCALE * L2_SCALE   (L1 output is in [0, L1_SCALE])
+    out bias scale = L2_SCALE * OUT_SCALE  (L2 output is in [0, L2_SCALE])
+
+  The final integer score is descaled by dividing by (L2_SCALE * OUT_SCALE)
+  to undo both factors — see nnue_engine.cpp's nnue_eval().
 """
 
 import argparse
@@ -48,7 +51,21 @@ import model as M
 FT_SCALE  = 127      # FT weights/bias → int16;  FT activations ∈ [0, FT_SCALE]
 L1_SCALE  = 64       # L1 weights → int8
 L2_SCALE  = 64       # L2 weights → int8
-OUT_SCALE = 600      # Output weights → int8
+# Output weights → int8. NOT 600: unlike ft/l1/l2, the output layer's inputs
+# are bounded to [0, L2_SCALE] by clipped_relu, so to produce a cp-scale
+# output (tens to hundreds of cp) from 32 such bounded inputs, the learned
+# output weights end up an order of magnitude larger than the other layers'
+# (measured on the current checkpoint: median |weight| ~48.5, max ~194.6,
+# vs. ft/l1/l2 weights all under ~9 in magnitude). OUT_SCALE=600 assumed the
+# same small-weight regime as the other layers and clipped ~97% of the
+# output layer's weights to the int8 boundary, destroying nearly all the
+# magnitude information the final layer had learned — confirmed via direct
+# comparison against the float checkpoint's output (see the corrhist/checkext
+# session's follow-up investigation in CLAUDE.md for the diagnostic that
+# found this). 0.6 keeps the observed weight range (±194.6) safely within
+# int8 with headroom for future retrains; recompute from the checkpoint if
+# retraining meaningfully changes the output layer's weight scale.
+OUT_SCALE = 0.6
 
 
 def _clamp(t: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
@@ -96,9 +113,23 @@ def quantise_out(weight: torch.Tensor, bias: torch.Tensor):
     """
     weight: [num_buckets, 32]  float32
     bias:   [num_buckets]      float32
+
+    Bias scale = L2_SCALE * OUT_SCALE — same pattern as l1/l2 (bias must
+    match the scale of the weighted-sum term it's added to, which here
+    carries both L2_SCALE from the incoming L2 activations and OUT_SCALE
+    from the output weights). A previous version of this function scaled
+    the bias by OUT_SCALE alone, silently dropping the L2_SCALE factor —
+    the resulting eval was inflated by exactly L2_SCALE (64x) on the
+    dot-product term relative to the bias term. That bug was masked for a
+    while by a *second*, independent bug (OUT_SCALE=600, clipping ~97% of
+    this layer's weights to the int8 boundary — see OUT_SCALE's comment
+    above) which coincidentally crushed the dot-product term down to a
+    plausible-looking magnitude. Fixing OUT_SCALE alone without this made
+    the eval visibly worse (thousands of cp), which is what surfaced this
+    second bug — see CLAUDE.md for the full diagnostic.
     """
-    w = _clamp(weight * OUT_SCALE, -128, 127).to(torch.int8)
-    b = _clamp(bias   * OUT_SCALE, -(2**31), 2**31 - 1).to(torch.int32)
+    w = _clamp(weight * OUT_SCALE,             -128, 127).to(torch.int8)
+    b = _clamp(bias   * L2_SCALE * OUT_SCALE,  -(2**31), 2**31 - 1).to(torch.int32)
     return w.numpy().tobytes(), b.numpy().tobytes()
 
 
