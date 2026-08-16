@@ -526,12 +526,61 @@ setup and the actual conditions a real SPRT run will use. **Every prior
 SPRT-blocking concern in this document is now resolved** — proceed with
 game-based A/B testing for the remaining prioritized items below.
 
-A **regression check (post-fix vs. pre-fix engine, same net, `elo0=-5
-elo1=5`) is running via the SPRT harness to confirm the fix itself didn't
-cost playing strength** (skipping a re-search only when time was already up
-should be neutral-to-positive, but wasn't measured before this note was
-written — check the harness output / `sprt_result.pgn` for the resolved
-verdict before treating this as fully closed).
+**A regression check (post-fix vs. pre-fix engine, `elo0=-5 elo1=5`) was
+attempted and abandoned as methodologically invalid, not because the fix is
+suspect.** At `tc=8+0.08` (~330ms/move) with `timemargin=200`, the pre-fix
+engine's 5–165ms/move overrun is a 10–15%+ *effective time-control edge*
+that a lenient margin never punishes — the test was comparing an honest
+engine to one quietly playing at ~1.1x the nominal time control, and after
+102 games was drifting negative (-63 ± 61 Elo) for exactly that reason, not
+because the fix costs search quality. **Don't re-run this comparison** —
+tightening the margin would only turn it into a forfeit-rate measurement,
+which is already known (pre-fix: real, repeated forfeits; post-fix: zero
+across 8126+ sampled moves). The fix is correct and necessary regardless of
+any Elo comparison: an engine that systematically overspends its allocated
+time is violating the UCI contract and will be disqualified or forfeited by
+any real arbiter with reasonable enforcement.
+
+**Important corollary: the ~2683 Elo figure at the top of this document is
+now known to be inflated by an uncertain amount and should not be used as a
+clean baseline for future comparisons.** It was measured with the pre-fix
+binary, which was quietly overrunning its time budget on nearly every move.
+Some fraction of that 2683 was time theft, not search quality. Every SPRT
+from here on (candidate vs. `nnue_engine_baseline`, both post-fix, both
+honest) is internally consistent and trustworthy — but a future re-measurement
+against Stockfish via `tournament.py`/a fresh 100-game run should be expected
+to land *below* 2683 even with zero code-quality regression, and that is not
+a red flag when it happens.
+
+## Operational lessons from this session — read before running more SPRTs
+
+1. **Never rebuild `./nnue_engine` while any SPRT process references that
+   path.** `fastchess` defaults to `restart=off`, meaning engine subprocesses
+   are long-lived across the whole run (not re-spawned per game) — an
+   already-running process keeps executing its originally-mapped binary
+   image in memory even if the file on disk is overwritten (standard Unix
+   exec semantics), so an in-flight run isn't corrupted by a rebuild. But
+   there is no guarantee against it (a crash-restart or future concurrency
+   change could spawn a process that picks up the new file), and it makes
+   auditing "what was actually tested" needlessly hard. Practice: copy the
+   candidate to a uniquely-named binary (e.g. `nnue_engine_<change>_candidate`)
+   *before* launching its SPRT, and don't touch `./nnue_engine` again until
+   that run is stopped or complete. `nnue_engine_baseline` should always be a
+   copy of the last-known-good, already-merged state — recopy it fresh from
+   `nnue_engine` immediately after each change lands, before starting the next.
+2. **Always run a small (~40-game, few-minute) sanity check before committing
+   to a full multi-hour SPRT.** This isn't a statistically meaningful Elo
+   measurement — it's a fast, cheap check for "is this obviously broken"
+   (a bug that makes the candidate lose ~90%+ of games doesn't need 2000
+   rounds to see; a healthy, balanced-looking 40-game result is the bar to
+   clear, not a p-value). This session's correction-history feature had two
+   serious bugs (see its commit history) that a 40-game check caught in
+   about 10 minutes each; the first real SPRT attempt had already burned 44
+   games trending toward a near-100% loss before this practice was adopted.
+   Command shape: same as the full SPRT but `-rounds 20 -games 2 -repeat`
+   (40 games total) with no `-sprt` flag, then eyeball `Games/Wins/Losses/
+   Draws` in the output — a wildly lopsided score (e.g. worse than ~15%) is
+   a bug signal, not a "the change is bad" signal; go find the bug.
 
 ## Prioritized next steps toward ~3000 Elo
 
