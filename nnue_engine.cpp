@@ -112,6 +112,10 @@ static constexpr int LMR_FULL_MOVES = 3;
 static constexpr int ASP_WINDOW     = 50;
 static constexpr int ASP_MAX_TRIES  = 4;
 static constexpr int DELTA_MARGIN   = 200;
+// Max check extensions stacked along a single search line. Was previously
+// unbounded (every checking move got +1 unconditionally) — see the
+// check-extension gate in the move loop for why this exists.
+static constexpr int CHECK_EXT_BUDGET = 16;
 [[maybe_unused]] static constexpr int RFP_MARGIN     = 120;
 
 static constexpr int FUTILITY_MARGIN[5] = {0, 100, 200, 300, 400};
@@ -1729,6 +1733,11 @@ struct SearchStack {
     // Pointer into g_cont_history for the move played at this ply:
     // [inCheck][piece][to][prev_piece][prev_to]
     int16_t (*contHist)[64] = nullptr; // points to g_cont_history[inCheck][piece][to]
+    // Cumulative count of check extensions applied on the path from the
+    // root to (and including) the move about to be made at this ply. Reset
+    // implicitly to 0 at the root via the sentinel ss[-1]/ss[-2] zero-init.
+    // See the check-extension gate below for why this exists.
+    int  checkExtensions = 0;
 };
 
 static Move g_killers[MAX_PLY][2];
@@ -2421,6 +2430,11 @@ static int alpha_beta(Board &board, Accumulator &acc,
         // Apply singular extension to the TT move (which is sorted first).
         if (m == tt_move) ext = singular_ext;
 
+        // SEE for the check-extension gate below, must be computed on the
+        // pre-move board (see_ge simulates the exchange sequence starting
+        // from `m` on the current position) — can't be deferred past do_move.
+        bool check_ext_see_ok = see_ge(board, m, 0);
+
         // Push accumulator BEFORE do_move
         if (is_castle || king_moved) {
             board.do_move(m);
@@ -2431,7 +2445,21 @@ static int alpha_beta(Board &board, Accumulator &acc,
         }
 
         bool gives_check = board.in_check();
-        if (gives_check && ext == 0) ext = 1;
+        // Check extension, gated (was previously unconditional +1 for every
+        // checking move, no SEE gate, no per-line budget — confirmed via
+        // node-count testing to cost 23-57% extra nodes at fixed depth in
+        // 3 of 4 positions tested, see CLAUDE.md). Only extend a check that
+        // isn't a losing sacrifice (SEE >= 0), and only up to a fixed budget
+        // of check extensions stacked along this search line, to bound the
+        // worst-case cost of a long forced-check sequence.
+        bool applied_check_ext = false;
+        int inherited_check_ext = (ss - 1)->checkExtensions;
+        if (gives_check && ext == 0 &&
+            inherited_check_ext < CHECK_EXT_BUDGET && check_ext_see_ok) {
+            ext = 1;
+            applied_check_ext = true;
+        }
+        ss->checkExtensions = inherited_check_ext + (applied_check_ext ? 1 : 0);
 
         // Set up continuation history pointer for this node
         ss->currentMove  = m;
