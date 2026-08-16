@@ -2008,6 +2008,59 @@ static int64_t g_prev_poll_ms = 0;      // elapsed_ms() at the poll before that
 static int64_t g_max_poll_gap_ms = 0;   // largest observed gap between consecutive polls this search
 static bool g_time_debug = false;  // set once in main() from NNUE_TIME_DEBUG env var
 
+// ── Pruning firing-rate / depth-distribution instrumentation ────────────
+// Purely additive diagnostic counters, gated by NNUE_PRUNE_DEBUG so there is
+// zero behavior/perf change when unset. Read via the "prunestats" UCI debug
+// command (see main loop). Used to re-measure which forward-pruning
+// mechanism is saturated vs. leaving nodes on the table, post the
+// output-layer quantization fix (the pre-fix firing-rate numbers in
+// CLAUDE.md were measured against a badly-distorted eval and are stale).
+static bool g_prune_debug = false;  // set once in main() from NNUE_PRUNE_DEBUG env var
+static int64_t g_nonleaf_nodes = 0;
+static int64_t g_nodes_by_depth[64] = {0};
+static int64_t g_rfp_checked = 0, g_rfp_hits = 0;
+static int64_t g_nmp_checked = 0, g_nmp_hits = 0;
+static int64_t g_probcut_checked = 0, g_probcut_hits = 0;
+static int64_t g_futility_skips = 0;
+static int64_t g_lmp_skips = 0;
+static int64_t g_histprune_skips = 0;
+// Depth-bucketed breakdown: pooling RFP's hit rate across depth 1-8 is
+// meaningless because its margin (234*(depth-improving)) varies 8x across
+// that range (0 at depth 1/improving, up to 1872 at depth 8/non-improving).
+// These arrays answer "which depth band is actually restrictive" instead.
+static int64_t g_rfp_checked_by_depth[64] = {0}, g_rfp_hits_by_depth[64] = {0};
+static int64_t g_futility_skips_by_depth[64] = {0};
+static int64_t g_lmp_skips_by_depth[64] = {0};
+// Simulated RFP hit-rate at several candidate margin coefficients (in place
+// of 234), computed alongside the real (unchanged) 234 check -- answers "how
+// much node mass would newly be pruned by a tighter coefficient" without
+// needing a full near-miss histogram or actually changing search behavior.
+static constexpr int RFP_CANDIDATE_COEFS[] = {234, 200, 180, 165, 150, 120, 100, 80};
+static constexpr int N_RFP_CANDIDATES = sizeof(RFP_CANDIDATE_COEFS) / sizeof(int);
+static int64_t g_rfp_hits_at_coef[N_RFP_CANDIDATES] = {0};
+// Same simulation, broken out by remaining depth -- the flat version above is
+// dominated by depth-1 node mass (44% of all nonleaf nodes), where margin is
+// already 0 whenever improving==true regardless of coefficient. This answers
+// the actual decision question: does a tighter coefficient gain anything in
+// the depth 2-4 band (~48% of node mass, margin 234-702cp, genuinely
+// restrictive) specifically, not just in aggregate.
+static int64_t g_rfp_hits_at_coef_by_depth[N_RFP_CANDIDATES][64] = {{0}};
+
+static void prune_stats_reset() {
+    g_nonleaf_nodes = 0;
+    for (auto &c : g_nodes_by_depth) c = 0;
+    g_rfp_checked = g_rfp_hits = 0;
+    g_nmp_checked = g_nmp_hits = 0;
+    g_probcut_checked = g_probcut_hits = 0;
+    g_futility_skips = g_lmp_skips = g_histprune_skips = 0;
+    for (auto &c : g_rfp_checked_by_depth) c = 0;
+    for (auto &c : g_rfp_hits_by_depth) c = 0;
+    for (auto &c : g_futility_skips_by_depth) c = 0;
+    for (auto &c : g_lmp_skips_by_depth) c = 0;
+    for (auto &c : g_rfp_hits_at_coef) c = 0;
+    for (auto &row : g_rfp_hits_at_coef_by_depth) for (auto &c : row) c = 0;
+}
+
 static bool out_of_time() {
     if (g_stop) return true;
     if (g_node_limit >= 0 && g_nodes >= g_node_limit) return true;
@@ -2294,16 +2347,40 @@ static int alpha_beta(Board &board, Accumulator &acc,
         improving = true;
     }
 
+    if (g_prune_debug) {
+        g_nonleaf_nodes++;
+        g_nodes_by_depth[std::clamp(depth, 0, 63)]++;
+    }
+
     if (!in_check && excludedMove == NO_MOVE) {
         // Reverse futility pruning (SF Step 7)
-        if (!is_pv && depth < 9 &&
-            static_eval - 234 * (depth - (int)improving) >= beta &&
-            static_eval < 900000)
-            return static_eval;
+        if (!is_pv && depth < 9) {
+            if (g_prune_debug) {
+                g_rfp_checked++;
+                g_rfp_checked_by_depth[std::clamp(depth, 0, 63)]++;
+                if (static_eval < 900000) {
+                    int cd = std::clamp(depth, 0, 63);
+                    for (int ci = 0; ci < N_RFP_CANDIDATES; ci++)
+                        if (static_eval - RFP_CANDIDATE_COEFS[ci] * (depth - (int)improving) >= beta) {
+                            g_rfp_hits_at_coef[ci]++;
+                            g_rfp_hits_at_coef_by_depth[ci][cd]++;
+                        }
+                }
+            }
+            if (static_eval - 234 * (depth - (int)improving) >= beta &&
+                static_eval < 900000) {
+                if (g_prune_debug) {
+                    g_rfp_hits++;
+                    g_rfp_hits_by_depth[std::clamp(depth, 0, 63)]++;
+                }
+                return static_eval;
+            }
+        }
 
         // Null move pruning (SF Step 8)
         if (allow_null && depth >= NMP_MIN_DEPTH && static_eval >= beta &&
             !is_pv && board.bb[board.stm][QUEEN] | board.bb[board.stm][ROOK]) {
+            if (g_prune_debug) g_nmp_checked++;
             int R = (1062 + 68 * depth) / 256 + std::min((static_eval - beta) / 190, 3);
             acc.null_push();
             board.do_move(NULL_MOVE);
@@ -2314,13 +2391,17 @@ static int alpha_beta(Board &board, Accumulator &acc,
                                          child_pv, child_pv_len, ss + 1);
             board.undo_move(NULL_MOVE);
             acc.pop();
-            if (null_score >= beta) return (null_score >= 900000) ? beta : null_score;
+            if (null_score >= beta) {
+                if (g_prune_debug) g_nmp_hits++;
+                return (null_score >= 900000) ? beta : null_score;
+            }
         }
 
         // ProbCut (SF Step 9): if a good capture passes a raised-beta qsearch, prune.
         int prob_cut_beta = beta + 209 - 44 * (int)improving;
         if (!is_pv && depth > 4 && std::abs(beta) < 900000 &&
             !(tt_hit && entry->depth >= depth - 3 && tt_value < prob_cut_beta)) {
+            if (g_prune_debug) g_probcut_checked++;
             // Try a few captures with SEE >= prob_cut_beta - static_eval
             Move caps[MAX_MOVES];
             int ncaps = board.gen_moves(caps, /*captures_only=*/true);
@@ -2356,6 +2437,7 @@ static int alpha_beta(Board &board, Accumulator &acc,
                 board.undo_move(m);
                 acc.pop();
                 if (pc_val >= prob_cut_beta) {
+                    if (g_prune_debug) g_probcut_hits++;
                     tt_store(key, depth - 3, score_to_tt(pc_val, ply), TT_LOWER, m);
                     return pc_val;
                 }
@@ -2454,7 +2536,13 @@ static int alpha_beta(Board &board, Accumulator &acc,
         bool is_castle  = (move_flags(m) == MF_CASTLE);
         bool king_moved = (pt == KING);
 
-        if (futil && moves_done > 0 && !is_capture && !is_prom) continue;
+        if (futil && moves_done > 0 && !is_capture && !is_prom) {
+            if (g_prune_debug) {
+                g_futility_skips++;
+                g_futility_skips_by_depth[std::clamp(depth, 0, 63)]++;
+            }
+            continue;
+        }
 
         // ── Late Move Pruning (LMP) ──────────────────────────────────────────
         // At low depths, once we've tried enough quiets the remaining ones are
@@ -2465,7 +2553,13 @@ static int alpha_beta(Board &board, Accumulator &acc,
             moves_done > 0 && best_score > -(MATE_SCORE - MAX_PLY) &&
             depth <= 8) {
             int lmp_limit = LMP_MOVES[depth][improving];
-            if (quiet_count >= lmp_limit) continue;
+            if (quiet_count >= lmp_limit) {
+                if (g_prune_debug) {
+                    g_lmp_skips++;
+                    g_lmp_skips_by_depth[std::clamp(depth, 0, 63)]++;
+                }
+                continue;
+            }
         }
 
         // ── History-based quiet pruning ──────────────────────────────────────
@@ -2479,7 +2573,10 @@ static int alpha_beta(Board &board, Accumulator &acc,
             if ((ss-1)->contHist) hist += (ss-1)->contHist[(int)pt][to];
             if ((ss-2)->contHist) hist += (ss-2)->contHist[(int)pt][to];
             // Threshold scales with depth: deeper searches are more lenient.
-            if (hist < -1024 * depth) continue;
+            if (hist < -1024 * depth) {
+                if (g_prune_debug) g_histprune_skips++;
+                continue;
+            }
         }
 
         // SEE-based pruning for late moves (SF Step 12)
@@ -2855,6 +2952,7 @@ struct Engine {
 
 int main() {
     g_time_debug = std::getenv("NNUE_TIME_DEBUG") != nullptr;
+    g_prune_debug = std::getenv("NNUE_PRUNE_DEBUG") != nullptr;
     init_magics();
     init_zobrist();
     init_lmr();       // static table; only needs to be built once
@@ -3029,6 +3127,61 @@ int main() {
                 int ev  = nnue_eval(engine.acc.stack[engine.acc.top],
                                     engine.board.stm == WHITE, bkt);
                 std::cout << "eval " << ev << " bucket " << bkt << "\n" << std::flush;
+            }
+
+        } else if (cmd == "prunestats") {
+            // Diagnostic-only: dump cumulative pruning firing-rate / node-by-
+            // depth counters accumulated since the last reset (or process
+            // start). Only accumulates when NNUE_PRUNE_DEBUG is set in the
+            // environment; otherwise all counters stay at 0. "prunestats
+            // reset" zeroes them without printing, for use as a per-position
+            // boundary in a driver script. Purely additive.
+            std::string sub; ss >> sub;
+            if (sub == "reset") {
+                prune_stats_reset();
+            } else {
+                std::cout << "prunestats nonleaf_nodes " << g_nonleaf_nodes
+                          << " rfp_checked " << g_rfp_checked << " rfp_hits " << g_rfp_hits
+                          << " nmp_checked " << g_nmp_checked << " nmp_hits " << g_nmp_hits
+                          << " probcut_checked " << g_probcut_checked << " probcut_hits " << g_probcut_hits
+                          << " futility_skips " << g_futility_skips
+                          << " lmp_skips " << g_lmp_skips
+                          << " histprune_skips " << g_histprune_skips
+                          << "\n";
+                std::cout << "prunestats_depth";
+                for (int d = 0; d < 64; d++)
+                    if (g_nodes_by_depth[d]) std::cout << " " << d << ":" << g_nodes_by_depth[d];
+                std::cout << "\n";
+
+                std::cout << "prunestats_rfp_by_depth";
+                for (int d = 0; d < 64; d++)
+                    if (g_rfp_checked_by_depth[d])
+                        std::cout << " " << d << ":" << g_rfp_hits_by_depth[d] << "/" << g_rfp_checked_by_depth[d];
+                std::cout << "\n";
+
+                std::cout << "prunestats_futility_by_depth";
+                for (int d = 0; d < 64; d++)
+                    if (g_futility_skips_by_depth[d]) std::cout << " " << d << ":" << g_futility_skips_by_depth[d];
+                std::cout << "\n";
+
+                std::cout << "prunestats_lmp_by_depth";
+                for (int d = 0; d < 64; d++)
+                    if (g_lmp_skips_by_depth[d]) std::cout << " " << d << ":" << g_lmp_skips_by_depth[d];
+                std::cout << "\n";
+
+                std::cout << "prunestats_rfp_coefs";
+                for (int ci = 0; ci < N_RFP_CANDIDATES; ci++)
+                    std::cout << " " << RFP_CANDIDATE_COEFS[ci] << ":" << g_rfp_hits_at_coef[ci];
+                std::cout << "\n";
+
+                for (int ci = 0; ci < N_RFP_CANDIDATES; ci++) {
+                    std::cout << "prunestats_rfp_coef_by_depth " << RFP_CANDIDATE_COEFS[ci];
+                    for (int d = 0; d < 64; d++)
+                        if (g_rfp_hits_at_coef_by_depth[ci][d])
+                            std::cout << " " << d << ":" << g_rfp_hits_at_coef_by_depth[ci][d];
+                    std::cout << "\n";
+                }
+                std::cout << "prunestats_end\n" << std::flush;
             }
 
         } else if (cmd == "stop") {
