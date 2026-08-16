@@ -1105,6 +1105,45 @@ struct Board {
     }
 };
 
+// ─────────────────────────── Perft ─────────────────────────────────────────
+// Movegen regression test: gen_moves() already filters to strictly legal
+// moves (see the "Filter illegal moves" pass inside it), so perft(1) is
+// just the legal move count and every deeper level is a straightforward
+// recursive sum — no separate legality re-check needed here. Exposed via
+// the "perft" UCI debug command below; run against known node counts for
+// standard test positions (startpos, Kiwipete, etc.) before trusting any
+// movegen change (e.g. staged move generation).
+static uint64_t perft(Board &board, int depth) {
+    if (depth == 0) return 1;
+    Move moves[MAX_MOVES];
+    int n = board.gen_moves(moves);
+    if (depth == 1) return (uint64_t)n;
+    uint64_t total = 0;
+    for (int i = 0; i < n; i++) {
+        board.do_move(moves[i]);
+        total += perft(board, depth - 1);
+        board.undo_move(moves[i]);
+    }
+    return total;
+}
+
+// Same as perft() but prints a per-root-move node-count breakdown to stdout
+// ("divide"), the standard technique for isolating which specific move a
+// movegen bug is hiding under when a plain perft total doesn't match.
+static uint64_t perft_divide(Board &board, int depth) {
+    Move moves[MAX_MOVES];
+    int n = board.gen_moves(moves);
+    uint64_t total = 0;
+    for (int i = 0; i < n; i++) {
+        board.do_move(moves[i]);
+        uint64_t cnt = (depth <= 1) ? 1 : perft(board, depth - 1);
+        board.undo_move(moves[i]);
+        std::cout << board.move_uci(moves[i]) << ": " << cnt << "\n";
+        total += cnt;
+    }
+    return total;
+}
+
 // ─────────────────────────── NNUE weights ──────────────────────────────────
 
 struct NNUEWeights {
@@ -2946,6 +2985,29 @@ int main() {
                           << " max_poll_gap=" << g_max_poll_gap_ms
                           << " overrun=" << (search_wall_ms - hard_limit) << "\n" << std::flush;
             }
+
+        } else if (cmd == "perft") {
+            // Movegen regression test, no search involved. Usage:
+            //   perft <depth>          -> total legal-move-tree node count
+            //   perft divide <depth>   -> per-root-move breakdown + total
+            // Compare against known node counts for standard test positions
+            // (see CLAUDE.md) before trusting any movegen change.
+            std::string sub; ss >> sub;
+            int pd; uint64_t total;
+            auto t0 = std::chrono::steady_clock::now();
+            if (sub == "divide") {
+                ss >> pd;
+                total = perft_divide(engine.board, pd);
+            } else {
+                pd = std::stoi(sub);
+                total = perft(engine.board, pd);
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            double secs = std::chrono::duration<double>(t1 - t0).count();
+            std::cout << "perft " << pd << " nodes " << total
+                      << " time " << secs << "s"
+                      << " nps " << (secs > 0 ? (uint64_t)(total / secs) : total)
+                      << "\n" << std::flush;
 
         } else if (cmd == "eval") {
             // Diagnostic-only: print the raw static NNUE eval (no search) of
