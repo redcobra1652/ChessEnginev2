@@ -672,18 +672,69 @@ below to reflect everything found this pass.
    +53.28 ± 22.74 Elo vs. the corrhist+checkext baseline, 598 games,
    `elo0=0 elo1=10`, H1 accepted, LOS 100%, zero time losses.**
    `nnue_engine_baseline` now holds this state.
-7. **Staged move generation (MovePicker-style).** Try the TT move first
-   without generating anything; only generate captures, then quiets, if
-   needed. Real node-count lever, but requires promoting the TT move's
-   legality check to fully rigorous — add a perft regression test (item 8)
-   first, given the illegal-move risk.
-8. **Perft-based movegen regression test.** Still no automated perft check
-   in the UCI loop. Add before item 7.
+7. **DEAD — staged move generation (MovePicker-style). Ruled out by
+   measurement, don't revisit without new evidence.** The idea (try the TT
+   move first with no movegen, generate captures/quiets only as needed) was
+   never actually about search quality, just cutting the cost of `gen_moves`
+   at nodes that cut off on the TT move alone. `perft` (item 8, done — see
+   below) makes that cost directly measurable: pure movegen + legality
+   filtering + do/undo, no search overhead at all, runs at **~100–200M
+   nodes/sec** (e.g. startpos depth 5: 4,865,609 nodes in 0.031s). Real
+   search runs at ~1.6–2.2M nodes/sec (see the earlier NPS diagnostic
+   section). That's a ~100x gap — `gen_moves` is single-digit nanoseconds
+   against a static eval alone costing ~213ns (measured earlier this
+   project), so even under a generous margin for what perft's number
+   doesn't include (TT probe, `score_moves`, SEE, actual eval — all real
+   search pays these and perft doesn't), movegen is nowhere near the
+   per-node cost floor. Staged movegen also carries real correctness risk
+   (promoting the TT move's legality assumption without regenerating the
+   full list) for a win that isn't there. Not worth it.
+8. **DONE — perft-based movegen regression test.** `perft <depth>` / `perft
+   divide <depth>` UCI commands added, purely additive. Verified against
+   the 5 standard test positions (startpos, Kiwipete, positions 3–5) at
+   depths 1–5: every result matches the known-correct node count exactly.
+   This is also what ruled out item 7 above — use it again before any
+   future movegen change.
 9. **Bigger/better NNUE net.** Still not the likely bottleneck — the
    2900–3300 architecture-based estimate is unverified either way (see
-   "Session follow-up" above), and every item above this one is cheaper to
-   try first and doesn't require retraining. Revisit only after items 1–5
-   are done and re-measured, and only with a genuine held-out validation
-   split (a separate diagnostic script, not a `train.py` change, per this
-   session's precedent with `net_eval_diagnostic.py`) to confirm it's
-   actually the limiting factor before assuming a bigger architecture helps.
+   "Session follow-up" above), and it's an expensive lever (requires
+   retraining) relative to what's left below. Revisit only after
+   multithreading is decided one way or the other, and only with a genuine
+   held-out validation split (a separate diagnostic script, not a
+   `train.py` change, per this session's precedent with
+   `net_eval_diagnostic.py`) to confirm it's actually the limiting factor.
+
+## Status: the original prioritized list is exhausted
+
+Items 1–4 and 6–8 are done (verified via SPRT or perft, see each item
+above); item 5 (Lazy SMP) is deliberately deferred (see below); item 9 is
+deprioritized as expensive-and-unlikely-to-be-the-bottleneck. **There is no
+undone item left on the original list — the next session should not assume
+one exists and go looking for it.** What actually produced every real win
+this session was finding something *wrong* in code that looked finished
+(an ungated re-search, an unconditional check extension, a single-limit
+time budget), not adding new features — that's the pattern to keep
+following, not a checklist to keep exhausting. Two concrete starting points
+for whoever picks this up next, both cheap (one-line change + 40-game
+sanity gate + SPRT) and neither yet tried:
+
+- **The tuned constants introduced this session were reasonable guesses,
+  not confirmed-optimal.** `CHECK_EXT_BUDGET=16`, the `1.3x` instability
+  stretch factor, `hard_limit = min(myTime/2, soft_limit*4)` — each is a
+  one-line change to A/B via the harness (e.g. try `CHECK_EXT_BUDGET` at 6
+  and 24; try the instability multiplier at 1.5).
+- **The aspiration window's full-width fallback re-searches the entire
+  depth from scratch at `-INF/INF`** whenever the score stays outside
+  `±ASP_WINDOW*ASP_MAX_TRIES` (`±50*4=±200`) after all retries. Not yet
+  measured how often this fires in real games — if it's non-rare, it's an
+  expensive fallback and the widening schedule (`ASP_WINDOW=50`,
+  `window += window/4 + 5` per retry) is worth revisiting.
+
+**Lazy SMP (item 5) is deliberately still deferred, not forgotten.** Both
+the internal SPRT and the Stockfish anchor (see "Current status" at the top)
+run single-threaded on both sides — the harness as it exists cannot see a
+multithreading win at all, so building it now means flying blind on
+whether it worked. Decide first whether multi-threaded strength is actually
+part of the goal; if so, the benchmark needs redesigning (a threaded
+opponent, a threaded anchor) before writing any thread-safety code, not
+after.
