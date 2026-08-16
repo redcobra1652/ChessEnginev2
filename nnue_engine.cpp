@@ -554,6 +554,7 @@ static constexpr int CR_WK = 1, CR_WQ = 2, CR_BK = 4, CR_BQ = 8;
 
 struct StateInfo {
     uint64_t   hash;
+    uint64_t   pawn_hash;       // XOR of g_zobrist_piece over pawns only (for correction history)
     int        ep_square;       // -1 = none
     int        castle_rights;   // bitmask
     int        halfmove_clock;
@@ -588,7 +589,7 @@ struct Board {
         king_sq[WHITE] = king_sq[BLACK] = 0;
         piece_count = 0;
         stm = WHITE;
-        cur = {0, -1, 0, 0, NO_PIECE};
+        cur = {0, 0, -1, 0, 0, NO_PIECE};
         history_top = 0;
     }
 
@@ -601,6 +602,7 @@ struct Board {
         if (pt == KING) king_sq[c] = sq;
         else piece_count++;
         cur.hash ^= g_zobrist_piece[c][pt][sq];
+        if (pt == PAWN) cur.pawn_hash ^= g_zobrist_piece[c][pt][sq];
     }
 
     void remove(Color c, PieceType pt, Square sq) {
@@ -611,6 +613,7 @@ struct Board {
         color_on[sq] = WHITE;  // reset to avoid stale color after castle undo
         if (pt != KING) piece_count--;
         cur.hash ^= g_zobrist_piece[c][pt][sq];
+        if (pt == PAWN) cur.pawn_hash ^= g_zobrist_piece[c][pt][sq];
     }
 
     void set_from_fen(const std::string &fen) {
@@ -1692,6 +1695,29 @@ static int16_t g_capture_history[6][64][6];
 // Countermove table [piece_type][to_square] → best reply to that move
 static Move g_countermoves[6][64];
 
+// ── Pawn correction history ─────────────────────────────────────────────────
+// Tracks the running average gap between static eval and search result,
+// indexed by pawn structure (see Board::pawn_hash), to correct systematic
+// NNUE eval bias for a given pawn skeleton (e.g. a structure the net
+// under/overrates). Standard technique, see
+// https://www.chessprogramming.org/Static_Evaluation_Correction_History —
+// this is a single-component (pawn-only) version of Stockfish's multi-
+// component correction history.
+static constexpr int CORRHIST_SIZE  = 16384;  // power of 2
+static constexpr int CORRHIST_LIMIT = 1024;   // cp; generous cap, gravity-bounded in practice
+static int16_t g_pawn_corrhist[2][CORRHIST_SIZE];  // [color][pawn_hash & mask]
+
+static inline int corrhist_index(uint64_t pawn_hash) {
+    return (int)(pawn_hash & (CORRHIST_SIZE - 1));
+}
+
+// Same self-bounding gravity update as hist_update, but with its own limit
+// since correction values are cp-scale, not move-ordering-score-scale.
+static inline void corrhist_update(int16_t &h, int bonus) {
+    bonus = std::clamp(bonus, -CORRHIST_LIMIT / 4, CORRHIST_LIMIT / 4);
+    h += (int16_t)(bonus - (int)h * std::abs(bonus) / CORRHIST_LIMIT);
+}
+
 // Stack frame for search — carries continuation history pointers and static eval
 struct SearchStack {
     int  staticEval = 0;
@@ -1723,6 +1749,7 @@ static void history_clear() {
     memset(g_cont_history,    0, sizeof g_cont_history);
     memset(g_capture_history, 0, sizeof g_capture_history);
     memset(g_countermoves,    0, sizeof g_countermoves);
+    memset(g_pawn_corrhist,   0, sizeof g_pawn_corrhist);
     g_tt_age = 0;
 }
 
@@ -1984,6 +2011,10 @@ static int quiescence(Board &board, Accumulator &acc, int alpha, int beta,
     int stm_w  = board.stm == WHITE;
     int bucket = get_bucket(board);
     int stand_pat = nnue_eval(acc.stack[acc.top], stm_w, bucket);
+    {
+        int corr = g_pawn_corrhist[board.stm][corrhist_index(board.cur.pawn_hash)];
+        stand_pat = std::clamp(stand_pat + corr, -MATE_SCORE + MAX_PLY, MATE_SCORE - MAX_PLY);
+    }
     // Refine the raw eval with a compatible TT bound, same idea as in the
     // main search: a stored bound that's tighter than the fresh eval is a
     // better basis for the stand-pat / pruning decisions below.
@@ -2159,6 +2190,13 @@ static int alpha_beta(Board &board, Accumulator &acc,
     // !in_check, so the only remaining use is `improving`, which treats
     // EVAL_NONE as "unknown" explicitly.
     int static_eval = in_check ? EVAL_NONE : nnue_eval(acc.stack[acc.top], stm_w, bucket);
+    // Apply pawn correction history: a running per-pawn-structure adjustment
+    // toward this position's typical (search - static eval) gap, correcting
+    // systematic NNUE bias for that structure. See declaration for details.
+    if (!in_check) {
+        int corr = g_pawn_corrhist[board.stm][corrhist_index(board.cur.pawn_hash)];
+        static_eval = std::clamp(static_eval + corr, -MATE_SCORE + MAX_PLY, MATE_SCORE - MAX_PLY);
+    }
     ss->staticEval  = static_eval;
 
     // Refine the eval with a compatible TT bound (Stockfish-style): a stored
@@ -2529,6 +2567,25 @@ static int alpha_beta(Board &board, Accumulator &acc,
                        (best_score >= beta)                            ? TT_LOWER : TT_UPPER;
         tt_store(key, depth, score_to_tt(best_score, ply), flag, best_move);
     }
+
+    // Correction history update — teach this pawn structure's slot to close
+    // the gap between static eval and what the search actually found.
+    // Gated the same way Stockfish gates it: not in check or aborted or a
+    // singular-verification call, no mate score (those reflect tactics, not
+    // positional eval bias), best move (if any) isn't a capture (captures
+    // change the pawn structure's context, not informative about *this*
+    // structure), and the error direction matches whether a move improved on
+    // alpha at all — guards against reinforcing noise from an all-pruned
+    // fail-low.
+    bool best_is_capture = best_move != NO_MOVE &&
+        (board.piece_on[move_to(best_move)] != NO_PIECE || move_flags(best_move) == MF_EP);
+    if (!in_check && !search_aborted && excludedMove == NO_MOVE &&
+        std::abs(best_score) < MATE_SCORE - MAX_PLY && !best_is_capture &&
+        (best_score > ss->staticEval) == (best_move != NO_MOVE)) {
+        int bonus = (best_score - ss->staticEval) * depth / 8;
+        corrhist_update(g_pawn_corrhist[board.stm][corrhist_index(board.cur.pawn_hash)], bonus);
+    }
+
     return best_score;
 }
 
