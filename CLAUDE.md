@@ -7,22 +7,39 @@ for evaluation, paired with a Stockfish-style alpha-beta search. Trained via
 Lichess cloud-eval labels at depth ≥20). Benchmarked/tournament-tested against
 Stockfish via `tournament.py` and `bench.py`.
 
-**Current status: the ~2683 Elo figure (measured via `tournament.py` against
-Stockfish@2750) is stale and known to be inflated — it was measured on a
-binary with the time-overrun bug (see below), which was quietly playing at
-~1.1x its allotted time on nearly every move. There is no fresh
-Stockfish-anchored Elo number yet. What IS known, from game-based SPRT (the
-trustworthy way to measure from here on, not `tournament.py`): the current
-`nnue_engine_baseline` — timing bug fixed, pawn correction history added,
-check extension gated — beats the honest pre-those-changes engine by
-**+159.65 ± 41.24 Elo** (256 games, `elo0=0 elo1=10`, H1 accepted, LOS
-100%). Read "Prioritized next steps toward ~3000 Elo" for what's done vs.
-open, and "Operational lessons from this session" before running any more
-SPRTs — both are near the bottom of this document. Getting a fresh
-Stockfish-anchored number (`tournament.py` or a Stockfish-opponent SPRT) is
-worth doing soon to re-anchor the ~3000 Elo goal against a real external
-reference, since the internal +159.65 Elo gain is relative to an
-already-stale baseline, not to Stockfish.**
+**Current status: the ~2683 Elo figure is retired — not "beaten" or
+"regressed from", just measured on a different, no-longer-trusted harness
+(`tournament.py`, fixed depth=7 for this engine vs. fixed 50ms for
+Stockfish — both sides were actually thinking for a similar ~20–50ms/move
+at that setting, which doesn't resemble a real time control and isn't
+comparable to anything below). The new, trustworthy external reference:
+**fastchess, `nnue_engine` vs. Stockfish 18 @ `UCI_LimitStrength=true
+UCI_Elo=2750`, `tc=8+0.08` equal both sides** (this IS a real, fair,
+equal-time-control comparison). Two data points on this anchor so far:
+
+| State | Score vs. SF@2750 | Elo |
+|---|---|---|
+| timing-fix + corrhist + checkext | 34.50% (200 games) | -111.37 ± 45.79 |
+| + soft/hard time management | 37.00% (200 games) | -92.46 ± 46.37 |
+
+The ~+19 Elo anchor movement is directionally consistent with, but smaller
+than, the +53.28 Elo the same time-management change measured on the
+internal (engine-vs-engine) SPRT — expected: different opponent, different
+noise floor, and Elo doesn't compound linearly across measurement scales.
+**Both anchor points are below "2750"** on Stockfish's own `UCI_Elo` scale,
+but per the note in "Next lever" below, `UCI_Elo` limits strength via
+move-selection noise + depth caps calibrated for longer time controls, and
+is known to under-limit (play stronger than its label) at fast time
+controls like `tc=8+0.08` — so treat -92 to -111 as a pessimistic estimate
+of true relative strength, not a precise CCRL-style number. **The ~3000 Elo
+goal was set against the retired 2683/`tournament.py` scale and has no
+defined meaning on this new anchor** — re-establishing what "3000" should
+mean here (e.g. a longer, more standard time control, or a CCRL-style
+external ladder) is worth doing at some point, but isn't blocking: keep
+improving and re-running this same anchor command to track real progress
+in the meantime. Read "Prioritized next steps toward ~3000 Elo" for what's
+done vs. open, and "Operational lessons from this session" before running
+any more SPRTs — both are near the bottom of this document.
 
 ## Baseline before this work
 
