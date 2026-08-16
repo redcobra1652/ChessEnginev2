@@ -718,17 +718,24 @@ following, not a checklist to keep exhausting. Two concrete starting points
 for whoever picks this up next, both cheap (one-line change + 40-game
 sanity gate + SPRT) and neither yet tried:
 
-- **The tuned constants introduced this session were reasonable guesses,
-  not confirmed-optimal.** `CHECK_EXT_BUDGET=16`, the `1.3x` instability
-  stretch factor, `hard_limit = min(myTime/2, soft_limit*4)` — each is a
-  one-line change to A/B via the harness (e.g. try `CHECK_EXT_BUDGET` at 6
-  and 24; try the instability multiplier at 1.5).
-- **The aspiration window's full-width fallback re-searches the entire
-  depth from scratch at `-INF/INF`** whenever the score stays outside
-  `±ASP_WINDOW*ASP_MAX_TRIES` (`±50*4=±200`) after all retries. Not yet
-  measured how often this fires in real games — if it's non-rare, it's an
-  expensive fallback and the widening schedule (`ASP_WINDOW=50`,
-  `window += window/4 + 5` per retry) is worth revisiting.
+- **`CHECK_EXT_BUDGET` tuning: tried 6, confirmed worse than 16, keep 16.**
+  SPRT vs. the `CHECK_EXT_BUDGET=16` baseline at `elo0=-5 elo1=5`: after
+  373 games the estimate had stabilized around **-23 to -27 Elo** (three
+  consecutive checkpoints all in that band, error bars tightening to
+  ±27–29) — a clear, consistent negative trend, stopped before full LLR
+  convergence since the direction was no longer in doubt. A tighter check-
+  extension budget costs more in missed tactics than it saves in nodes.
+  **Untried, still worth a shot:** a *larger* budget (e.g. 24) — the
+  6-vs-16 result says "don't go tighter," it doesn't say 16 is the ceiling
+  in the other direction. Also untried: the `1.3x` instability stretch
+  factor and `hard_limit = min(myTime/2, soft_limit*4)` formula in time
+  management — both still just reasonable guesses.
+- **DEAD — aspiration window fallback rate.** Instrumented directly
+  (temporary counters, since removed): zero full-width fallbacks fired
+  across 45 aspiration-window iterations spanning 7 diverse positions
+  (openings through tactical middlegames) at a realistic ~330–1320ms
+  budget. The `ASP_MAX_TRIES=4` retries with widening converge before ever
+  needing it in practice — not a real cost center, don't pursue this.
 
 **Lazy SMP (item 5) is deliberately still deferred, not forgotten.** Both
 the internal SPRT and the Stockfish anchor (see "Current status" at the top)
