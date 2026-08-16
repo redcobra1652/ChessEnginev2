@@ -671,7 +671,14 @@ below to reflect everything found this pass.
    `go movetime`/`go depth`/`go infinite` unaffected. **SPRT-verified:
    +53.28 ± 22.74 Elo vs. the corrhist+checkext baseline, 598 games,
    `elo0=0 elo1=10`, H1 accepted, LOS 100%, zero time losses.**
-   `nnue_engine_baseline` now holds this state.
+   `nnue_engine_baseline` now holds this state. **As of the end of this
+   session, `nnue_engine_baseline` is rebuilt fresh from HEAD
+   (`6c0c9b1`)** — it also includes the (behaviorally inert but additive)
+   perft command and every documented-dead tuning experiment was reverted
+   before that rebuild, so `nnue_engine_baseline`'s source == `nnue_engine.cpp`
+   at HEAD exactly. Keep this invariant: rebuild `nnue_engine_baseline`
+   fresh after every commit that changes `nnue_engine.cpp`, don't reuse an
+   older copy (see "Operational lessons" above for why this matters).
 7. **DEAD — staged move generation (MovePicker-style). Ruled out by
    measurement, don't revisit without new evidence.** The idea (try the TT
    move first with no movegen, generate captures/quiets only as needed) was

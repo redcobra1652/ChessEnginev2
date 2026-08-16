@@ -9,6 +9,7 @@ nnue_engine_baseline
 fastchess
 config.json
 sprt_result.pgn.*
+.claude/
 profile.txt
 net_eval_diagnostic_results.csv
 __pycache__/
