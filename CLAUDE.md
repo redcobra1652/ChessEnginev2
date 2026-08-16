@@ -154,16 +154,146 @@ reading from a badly corrupted evaluation function the entire time. This
 single fix outweighs the combined effect of every search fix this session
 found, on both the internal harness and the external anchor.
 
-**Caveat, and a concrete next step:** this diagnostic only checked the
-output layer in this depth. The `l2` layer shows 3.2% weight clipping —
-minor by comparison, but non-zero. `verify_quantization.py` (new,
-checked-in script covering all three of this section's diagnostic steps —
-run it after any retrain or any change to `serialize.py`'s quantization,
-before trusting the resulting `.nnue` file in the engine) reports this
-every time it runs; if further Elo is wanted after re-establishing the
-roadmap (see "Prioritized next steps" below, which predates this fix and
-needs re-evaluating in light of it), tuning `L2_SCALE` down to reduce that
-3.2% is the cheapest remaining lever in this area.
+`verify_quantization.py` (checked-in script covering all three of this
+section's diagnostic steps — byte-exactness, per-layer clipping, and
+quantized-vs-float eval agreement) reports the current state every time it
+runs; use it after any retrain or any change to `serialize.py`'s
+quantization, before trusting the resulting `.nnue` file in the engine.
+
+### Follow-up audit: is there anything else to fix in the quantization pipeline?
+
+Asked directly by the user after the fix above landed — full answer,
+including one thing that looked worth fixing and, on direct empirical
+test, turned out not to be:
+
+- **`l2.weight`'s 3.2% clipping — investigated, tested, confirmed NOT worth
+  fixing.** `L2_SCALE` does double duty: it's both `l2.weight`'s
+  quantization scale *and* the activation-resolution scale for the 32
+  values feeding the output layer (same architectural pattern as
+  `FT_SCALE`/`L1_SCALE`). Lowering it to reduce clipping also coarsens
+  activation precision — a real tradeoff, not a one-directional fix.
+  Tested empirically (simulated the quantized pipeline in Python at
+  several `L2_SCALE` values, measured divergence from the float model on
+  the same 6 test positions used in the section above):
+
+  | `L2_SCALE` | mean \|float − quant\| | max \|float − quant\| |
+  |---|---|---|
+  | 64 (current) | 2.86cp | 4.44cp |
+  | 32 | 2.75cp | 3.83cp |
+  | 20 | 4.13cp | 7.14cp |
+  | 14 (zero clipping) | 5.83cp | 10.14cp |
+
+  Going lower to chase zero clipping makes agreement with the float model
+  *worse* — resolution loss outweighs the clipping benefit below ~32.
+  64 is already close to optimal. **Left unchanged; don't revisit without
+  new evidence.** (32 shows a marginally smaller max-diff on this n=6
+  sample, but the gap is within likely noise for that sample size — not
+  worth the risk of touching `quantise_l2`, `quantise_out`, and the C++
+  constant for an unconfirmed sub-1cp improvement.)
+- **`ft`/`l1` clipping**: ~0% and 0.006% respectively — both already
+  near-optimal (measured `L1_SCALE` headroom: current 64 vs. a
+  zero-clipping threshold of ~58.8, i.e. already close to the ceiling).
+  No action needed.
+- **Dead code with the same historical bug, not touched.** `engine/`
+  (a separate, older prototype — `evaluate.h`, `types.h`, `main.cpp`, a
+  compiled `engine/engine` binary) has its own hardcoded `OUT_SCALE=600`,
+  unfixed. Confirmed it is *not* part of the active pipeline — `tournament.py`,
+  `bench.py`, and every fastchess SPRT this whole project reference
+  `nnue_engine.cpp`/`nnue_engine`, not `engine/`. Only `debug.py`
+  references `engine/engine`, and nothing calls `debug.py`. Left alone
+  deliberately (fixing dead code is wasted effort and risks confusion
+  about which binary is "the" engine) — worth a cleanup pass or deletion
+  at some point, but not an Elo-bearing task.
+- **Backup files** (`bakcup.cpp`, `nnue_engine_backup.cpp`,
+  `nnue_engine_backup_2.cpp`) also carry the old `OUT_SCALE=600` — these
+  are pre-session historical snapshots, referenced by nothing. Same
+  treatment as `engine/`: not touched, not relevant.
+
+### Does the search's eval scale now match what its ported-from-Stockfish pruning margins assume?
+
+This was flagged as an open, unresolved concern in the immediately
+preceding session turn — resolved this pass with cleaner data. **Short
+answer: no strong evidence of the scale mismatch that was worried about.
+Don't rescale the pruning margins based on the earlier (confounded)
+signal.**
+
+**What was wrong with the earlier signal:** `net_eval_diagnostic.py`
+compares this engine's *static* eval against Stockfish's *searched* score
+(`sf.search_score_cp()`, i.e. after real search, not a raw eval) on
+real-game positions. Search scores are systematically more extreme than
+static eval on the same position — search finds forced wins, converts
+static advantages into decisive material, spots mate — none of which a
+one-shot NNUE evaluation can see. The earlier regression (slope=0.207) and
+median-ratio (1.9x) disagreed with each other (Pearson r only 0.52)
+precisely because they were measuring "how much more decisive is search
+than static eval," not a clean eval-to-eval scale factor — an apples-to-
+oranges comparison, not a scale bug.
+
+**Clean re-measurement:** modern Stockfish exposes its own *static* eval
+directly via its `eval` console command (not a UCI command — run
+interactively: `position fen ...` then `eval`, read the `Final evaluation`
+line, in pawns). Compared directly against this engine's static eval (via
+the `eval` UCI debug command) on the same 6 test positions, no search
+involved on either side:
+
+| position | ours (cp) | Stockfish static (cp) | ratio |
+|---|---|---|---|
+| startpos | 31.2 | 15.0 | 2.078 |
+| r1bqk2r... (mg) | 139.2 | 178.0 | 0.782 |
+| r1bqkb1r... (mg) | 31.8 | 41.0 | 0.776 |
+| 2kr3r... (mg) | -84.8 | -102.0 | 0.831 |
+| KPvK endgame | 16.3 | 0.0 | undefined (÷0) |
+| Kiwipete-like | -171.7 | -171.0 | 1.004 |
+
+Four of five defined ratios cluster in **[0.78, 1.20]** — reasonably
+close to 1.0, not the 2–7x gap the search-score-based comparison implied.
+The one outlier (startpos, 2.08x) is on a small absolute eval (15cp) where
+ratio is a noisy metric for a small absolute difference (16cp) — not
+strong evidence of a systematic multiplicative bias.
+
+**Conclusion: the Stockfish-ported pruning margins (RFP=234, futility
+margins, NMP formula, aspiration window, etc.) are probably reasonably
+well-matched to this engine's eval scale, on the evidence available.**
+There is no confirmed case for a blanket rescale. n=6 positions is a small
+sample — if this matters enough to someone to chase a tighter answer, get
+more data points before acting, not before to guard against the small
+sample happening to look reassuring by chance.
+
+### Is it worth pruning more aggressively now that the eval is trustworthy?
+
+Reasoned answer, not yet tested — a fair question but not a slam-dunk
+"yes" the way the user's framing suggested, for a specific reason worth
+being precise about:
+
+**The quantization bug's error was ~30–160cp of *systematic distortion*,
+not noise.** Pruning margins like `RFP_MARGIN=234` exist to buffer against
+a fundamentally different problem: a static eval, however precisely
+computed, can still be *wrong relative to what a deeper search would find*
+(missed tactics, positional complexity one ply of NNUE can't see) — that
+gap is a property of net quality and search depth, not of quantization
+precision. Fixing quantization noise (~4cp now, was 30–160cp) doesn't
+directly imply the *net's fundamental static-vs-searched accuracy* changed
+at all — that was never what was broken.
+
+**That said, there is a real, more indirect argument for retesting margins
+now, not because of a scale theory, but because the eval itself materially
+changed.** Every existing pruning constant in this codebase was ported
+from Stockfish's source without dedicated tuning against *this* net, and
+whatever behavior seemed "fine" earlier this session (the RFP/futility
+firing-rate check in the "Session follow-up" section further down,
+showing "a large, healthy fraction" of applicable nodes triggering) was
+measured against the **old, badly-distorted eval** — not evidence the
+current margins are well-tuned for the *fixed* eval's actual behavior.
+That check needs re-running post-fix before trusting its conclusion again.
+
+**Recommendation: don't blanket-loosen or tighten margins on a theory.**
+If this is worth pursuing, treat it exactly like every other change this
+session — pick one concrete, bounded hypothesis (e.g., tighten
+`RFP_MARGIN` by a modest amount, or re-run the RFP/futility firing-rate
+node-count check against the current eval to see if it still looks
+healthy), 40-game sanity gate, then SPRT. Not done this session — flagging
+as the most promising remaining lever if more Elo is wanted, but it needs
+its own dedicated test, not a bundled guess.
 
 ## Baseline before this work
 
