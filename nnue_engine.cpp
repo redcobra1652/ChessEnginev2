@@ -1955,6 +1955,7 @@ static int64_t elapsed_ms() {
 // poll and when search() finally returned. A large gap localizes the
 // overrun to an unpolled stretch of code; a small gap means the overrun is
 // elsewhere (allocation, output, or the budget itself).
+static int64_t g_soft_limit_ms = -1;    // -1 = disabled (fixed movetime/depth/infinite searches)
 static int64_t g_last_poll_ms = 0;      // elapsed_ms() at the most recent poll
 static int64_t g_prev_poll_ms = 0;      // elapsed_ms() at the poll before that
 static int64_t g_max_poll_gap_ms = 0;   // largest observed gap between consecutive polls this search
@@ -2659,7 +2660,15 @@ struct Engine {
         load_nnue(path);
     }
 
-    std::pair<Move,int> search(int depth, int64_t movetime_ms) {
+    // soft_limit_ms: the "normal" time allocation for this move — once used
+    // up, iterative deepening won't start another depth unless the best
+    // move has been unstable (see below). -1 disables soft-limit early exit
+    // (fixed `go movetime`/`go depth`/`go infinite` — those should use the
+    // full hard limit, not stop early). hard_limit_ms is the absolute cap
+    // (what out_of_time() enforces, same role the old single `movetime_ms`
+    // parameter played) — for -1 soft_limit_ms callers, hard_limit_ms is
+    // that same fixed budget.
+    std::pair<Move,int> search(int depth, int64_t soft_limit_ms, int64_t hard_limit_ms) {
         if (!g_weights.loaded) {
             Move moves[MAX_MOVES];
             int n = board.gen_moves(moves);
@@ -2668,7 +2677,8 @@ struct Engine {
 
         g_stop          = false;
         g_start_time    = Clock::now();
-        g_time_limit_ms = movetime_ms;
+        g_time_limit_ms = hard_limit_ms;
+        g_soft_limit_ms = soft_limit_ms;
         g_nodes         = 0;
         g_last_poll_ms  = 0;
         g_prev_poll_ms  = 0;
@@ -2695,8 +2705,22 @@ struct Engine {
         Move pv[MAX_PLY];
         int  pv_len = 0;
 
+        // Best-move instability tracking: each time the best move changes
+        // between consecutive completed iterations (from a depth where that
+        // means something, not the noisy shallow depths), stretch the soft
+        // limit a bit — an unstable position is exactly when cutting the
+        // search short is most likely to return the wrong move. Always
+        // capped by the hard limit via out_of_time().
+        int64_t effective_soft = g_soft_limit_ms;
+
         for (int d = 1; d <= depth; d++) {
             if (out_of_time()) break;
+            // Soft-limit early exit: once the normal allocation for this
+            // move is used up and the line hasn't been unstable, don't
+            // start another iteration. Only active for wtime/btime-derived
+            // budgets (g_soft_limit_ms >= 0) — fixed `go movetime`/`go
+            // depth`/`go infinite` searches use the full hard limit.
+            if (g_soft_limit_ms >= 0 && d > 1 && elapsed_ms() >= effective_soft) break;
 
             Move iter_pv[MAX_PLY]; int iter_pv_len = 0;
             int score;
@@ -2740,6 +2764,14 @@ struct Engine {
             if (out_of_time() && d > 1) break;
 
             if (iter_pv_len > 0) {
+                // Instability: the best move changed from the previous
+                // completed iteration. Ignore the shallow depths, where this
+                // is just noise rather than a signal worth reacting to.
+                if (g_soft_limit_ms >= 0 && d >= 5 &&
+                    best_move != NO_MOVE && iter_pv[0] != best_move) {
+                    effective_soft = std::min(g_time_limit_ms,
+                                               (int64_t)(effective_soft * 1.3));
+                }
                 best_move  = iter_pv[0];
                 best_score = score;
                 prev_score = score;
@@ -2872,16 +2904,26 @@ int main() {
             }
             // go infinite: search until "stop" — no time or node limit
             if (infinite) { movetime = -1; go_nodes = -1; }
-            // Time management
+            // Time management: soft_limit is the "normal" per-move
+            // allocation (the same formula as before); hard_limit is a
+            // generous cap that the soft-limit/instability-extension logic
+            // in search() is allowed to grow into, bounded so a single move
+            // can never eat more than half the remaining clock. -1 disables
+            // the soft-limit-early-exit path entirely (used for fixed
+            // `go movetime`/`go depth`/`go infinite`, where the full budget
+            // should always be used, not cut short).
+            int64_t soft_limit = -1, hard_limit = movetime;
             if (!infinite && movetime < 0 && go_nodes < 0 && (wtime >= 0 || btime >= 0)) {
                 int myTime = (engine.board.stm == WHITE) ? wtime : btime;
                 int myInc  = (engine.board.stm == WHITE) ? winc  : binc;
                 if (myTime >= 0) {
-                    movetime = std::max((int64_t)50, (int64_t)(myTime / movestogo + myInc * 0.8));
+                    soft_limit = std::max((int64_t)50, (int64_t)(myTime / movestogo + myInc * 0.8));
+                    hard_limit = std::min((int64_t)(myTime / 2), soft_limit * 4);
+                    hard_limit = std::max(hard_limit, soft_limit);  // never below soft
                 }
             }
             g_node_limit = go_nodes;   // -1 if not set; search() will clear and re-apply
-            auto [mv, score] = engine.search(depth, movetime);
+            auto [mv, score] = engine.search(depth, soft_limit, hard_limit);
             auto t_after_search = Clock::now();
             int64_t search_wall_ms = elapsed_ms();  // uses g_start_time set inside search()
             std::string best = (mv != NO_MOVE) ? engine.board.move_uci(mv) : "0000";
@@ -2894,14 +2936,15 @@ int main() {
                     t_after_print - t_after_search).count();
                 int64_t unpolled_gap_ms = search_wall_ms - g_last_poll_ms;
                 int64_t final_poll_interval_ms = g_last_poll_ms - g_prev_poll_ms;
-                std::cerr << "[TIMEDBG] budget=" << movetime
+                std::cerr << "[TIMEDBG] budget=" << hard_limit
+                          << " soft=" << soft_limit
                           << " search_wall=" << search_wall_ms
                           << " recv_to_return=" << recv_to_return_ms
                           << " print_overhead=" << print_overhead_ms
                           << " last_poll_to_return_gap=" << unpolled_gap_ms
                           << " final_poll_interval=" << final_poll_interval_ms
                           << " max_poll_gap=" << g_max_poll_gap_ms
-                          << " overrun=" << (search_wall_ms - movetime) << "\n" << std::flush;
+                          << " overrun=" << (search_wall_ms - hard_limit) << "\n" << std::flush;
             }
 
         } else if (cmd == "eval") {
