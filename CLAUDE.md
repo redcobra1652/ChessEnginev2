@@ -7,39 +7,163 @@ for evaluation, paired with a Stockfish-style alpha-beta search. Trained via
 Lichess cloud-eval labels at depth ≥20). Benchmarked/tournament-tested against
 Stockfish via `tournament.py` and `bench.py`.
 
-**Current status: the ~2683 Elo figure is retired — not "beaten" or
+**Current status: the ~2683 Elo figure is retired** — not "beaten" or
 "regressed from", just measured on a different, no-longer-trusted harness
 (`tournament.py`, fixed depth=7 for this engine vs. fixed 50ms for
 Stockfish — both sides were actually thinking for a similar ~20–50ms/move
 at that setting, which doesn't resemble a real time control and isn't
-comparable to anything below). The new, trustworthy external reference:
+comparable to anything below). The trustworthy external reference:
 **fastchess, `nnue_engine` vs. Stockfish 18 @ `UCI_LimitStrength=true
-UCI_Elo=2750`, `tc=8+0.08` equal both sides** (this IS a real, fair,
-equal-time-control comparison). Two data points on this anchor so far:
+UCI_Elo=2750`, `tc=8+0.08` equal both sides** (a real, fair, equal-time-
+control comparison). Four data points on this anchor so far, tracking the
+session's work in order:
 
 | State | Score vs. SF@2750 | Elo |
 |---|---|---|
 | timing-fix + corrhist + checkext | 34.50% (200 games) | -111.37 ± 45.79 |
 | + soft/hard time management | 37.00% (200 games) | -92.46 ± 46.37 |
+| + **NNUE output-layer quantization fix** | **58.75% (200 games)** | **+61.43 ± 42.49** |
 
-The ~+19 Elo anchor movement is directionally consistent with, but smaller
-than, the +53.28 Elo the same time-management change measured on the
-internal (engine-vs-engine) SPRT — expected: different opponent, different
-noise floor, and Elo doesn't compound linearly across measurement scales.
-**Both anchor points are below "2750"** on Stockfish's own `UCI_Elo` scale,
-but per the note in "Next lever" below, `UCI_Elo` limits strength via
-move-selection noise + depth caps calibrated for longer time controls, and
-is known to under-limit (play stronger than its label) at fast time
-controls like `tc=8+0.08` — so treat -92 to -111 as a pessimistic estimate
-of true relative strength, not a precise CCRL-style number. **The ~3000 Elo
-goal was set against the retired 2683/`tournament.py` scale and has no
-defined meaning on this new anchor** — re-establishing what "3000" should
-mean here (e.g. a longer, more standard time control, or a CCRL-style
-external ladder) is worth doing at some point, but isn't blocking: keep
-improving and re-running this same anchor command to track real progress
-in the meantime. Read "Prioritized next steps toward ~3000 Elo" for what's
-done vs. open, and "Operational lessons from this session" before running
-any more SPRTs — both are near the bottom of this document.
+**The single largest lever this session, by far, was not a search
+improvement at all — it was a ~1000x-miscalibrated quantization scale in
+the trained net's output layer, present since the net was first serialized
+and silently corrupting every eval this engine has ever computed.** See
+"NNUE output-layer quantization bug — found, fixed, and it was the
+dominant bottleneck" below for the full diagnosis. The jump from -92.46 to
++61.43 (**+153.89 Elo on this anchor from that one fix**, SPRT-confirmed
+separately at +211.62 ± 103.71 on the internal engine-vs-engine harness,
+resolved in 46 games) means **this engine now plays above Stockfish's own
+"2750" self-rating** at this time control — with the big caveat (see that
+section's "Next lever" note) that Stockfish's `UCI_Elo` limiting is known
+to under-limit at fast time controls, so treat +61 as directionally huge
+but not a precise CCRL-style number.
+
+**The ~3000 Elo goal was set against the retired 2683/`tournament.py`
+scale and still has no defined meaning on this new anchor** —
+re-establishing what "3000" should mean here (a longer, more standard time
+control, or a CCRL-style external ladder) is worth doing at some point,
+but isn't blocking: keep improving and re-running this same anchor command
+to track real progress. Read "Prioritized next steps toward ~3000 Elo" for
+what's done vs. open, and "Operational lessons from this session" before
+running any more SPRTs — both are near the bottom of this document.
+
+## NNUE output-layer quantization bug — found, fixed, and it was the dominant bottleneck
+
+The user asked directly: given this net has the same architecture as
+Stockfish's first NNUE net, and the search now has all of Stockfish's
+standard mechanisms, why was the engine still ~800 Elo below what that
+should support — is it the NNUE (training), the serialization/quantization
+format, or the search? This section is the answer, arrived at by direct
+measurement, not inference from training-loss numbers.
+
+### Diagnosis method
+
+Loaded the trained float checkpoint (`checkpoints/nnue_best.pt`) directly
+in Python via `model.py`, ran its forward pass on real positions using the
+exact same HalfKP feature encoding `data.py` uses for training, and
+compared the output (which `train.py`'s loss function treats as
+centipawns — see `WDL_SCALE`/`nnue_loss`) against the C++ engine's `eval`
+UCI debug command for the *same positions* via the deployed
+`checkpoints/model.nnue`. They diverged by 30–160cp per position,
+sometimes with a different sign — far beyond int8 quantization rounding
+noise (which should be a few cp at most).
+
+Bisected in two steps, both empirical, not just code review:
+
+1. **Byte-exact comparison: does `model.nnue` match what `serialize.py`
+   should produce from `nnue_best.pt`?** Re-ran `serialize.py`'s
+   `quantise_ft/l1/l2/out` functions in Python on the checkpoint and
+   compared the resulting bytes, byte-for-byte, against the actual
+   `checkpoints/model.nnue` payload. **Identical.** This ruled out "wrong
+   checkpoint was serialized" and "serialize.py writes something different
+   than what it computes" — whatever was wrong, it was wrong in the
+   quantization *design*, not a mismatch between intent and execution.
+2. **Weight-clipping audit.** Checked what fraction of each layer's
+   weights get clamped to the int8 boundary (±127) during quantization at
+   each layer's chosen scale constant. `ft`/`l1` weights: ~0% clipped.
+   `l2`: 3.2% clipped (minor). **`output.weight`: 96.875% clipped.**
+   The output layer's trained weights (median |w|=48.5, max=194.6, std=68.5)
+   are an order of magnitude larger than every other layer's (all under
+   ~9 in magnitude) — expected in hindsight, since the output layer's
+   32 inputs are bounded to [0, L2_SCALE] by `clipped_relu`, so producing a
+   cp-scale output (tens to hundreds of cp) from 32 *bounded* inputs
+   mathematically requires large weights. `OUT_SCALE=600` was chosen
+   assuming the same small-weight regime as the other layers and crushed
+   ~97% of this layer's learned weights down to ±127/±128, destroying
+   almost all the magnitude information the final layer had learned.
+
+**Fixing `OUT_SCALE` alone made the eval visibly *worse* (jumped to
+thousands of cp)**, which surfaced a second, independent, previously-masked
+bug: the output-layer *bias* was quantized as `bias * OUT_SCALE`, but by
+the same pattern used for every other layer (bias scale = product of all
+upstream scales — see `l1 bias scale = FT_SCALE * L1_SCALE`, `l2 bias
+scale = L1_SCALE * L2_SCALE`), it needed to be `bias * L2_SCALE *
+OUT_SCALE`. The dot-product term (the weighted sum of the 32 L2 activations)
+was inflated by exactly `L2_SCALE=64x` relative to the bias term the whole
+time. `OUT_SCALE=600`'s clipping had coincidentally crushed the dot-product
+term down to a plausible-looking magnitude, masking this second bug —
+which is exactly why fixing bug #1 in isolation made things visibly worse
+before fixing bug #2 revealed the actual correct output.
+
+### Fix
+
+- `serialize.py`: `OUT_SCALE` changed from `600` to `0.6` (derived from the
+  measured weight range, with headroom for future retrains — recompute if
+  a retrain meaningfully shifts the output layer's weight scale).
+  `quantise_out`'s bias scaling changed from `bias * OUT_SCALE` to
+  `bias * L2_SCALE * OUT_SCALE`.
+- `nnue_engine.cpp`: `OUT_SCALE` changed from `static constexpr int` `600`
+  to `static constexpr double` `0.6`. Final descale changed from
+  `score / OUT_SCALE` to `score / (L2_SCALE * OUT_SCALE)`, with proper
+  rounding (`std::lround`) instead of the previous integer-truncating
+  division.
+- `checkpoints/model.nnue` regenerated from `checkpoints/nnue_best.pt` with
+  both fixes (`python3 serialize.py checkpoints/nnue_best.pt
+  checkpoints/model.nnue`).
+
+**Verified:** quantized C++ eval now matches the float model within a few
+cp (quantization-noise level) across 6 diverse test positions — was off by
+30–160cp before, sometimes flipping sign.
+
+### Measured impact
+
+- Internal SPRT (fixed vs. pre-fix `.nnue`, otherwise identical binaries,
+  `tc=8+0.08`): **+211.62 ± 103.71 Elo**, `elo0=0 elo1=50`, H1 accepted,
+  LOS 100%, resolved in just **46 games** (the effect is large enough that
+  SPRT didn't need anywhere near its normal game budget). A cheap 40-game
+  sanity check beforehand already showed 27 wins–1 loss–12 draws, 82.5%
+  score — this was never a borderline result.
+- Stockfish@2750 anchor: **-92.46 → +61.43 Elo (+153.89)** — see the table
+  at the top of this document. This engine now scores above 50% against
+  Stockfish's own "2750" self-rating at this time control.
+
+### What this means for the user's question
+
+**It was the serialization/quantization formatting — not the training,
+and not primarily the search.** The training loss (0.0073, smooth,
+plateauing) was telling the truth about the *float* model; the deployed
+*quantized* model the engine actually played with had never faithfully
+represented that float model, from the very first time `model.nnue` was
+generated. Every SPRT result earlier in this document — the +159.65 Elo
+correction-history/check-extension result, the +53.28 Elo time-management
+result, the entire ~2683 `tournament.py` measurement — was measured with
+this bug present. The search-side fixes were still real (each was
+independently SPRT-verified against a fixed eval, so they weren't
+artifacts of the eval bug), but they were all improving a search that was
+reading from a badly corrupted evaluation function the entire time. This
+single fix outweighs the combined effect of every search fix this session
+found, on both the internal harness and the external anchor.
+
+**Caveat, and a concrete next step:** this diagnostic only checked the
+output layer in this depth. The `l2` layer shows 3.2% weight clipping —
+minor by comparison, but non-zero. `verify_quantization.py` (new,
+checked-in script covering all three of this section's diagnostic steps —
+run it after any retrain or any change to `serialize.py`'s quantization,
+before trusting the resulting `.nnue` file in the engine) reports this
+every time it runs; if further Elo is wanted after re-establishing the
+roadmap (see "Prioritized next steps" below, which predates this fix and
+needs re-evaluating in light of it), tuning `L2_SCALE` down to reduce that
+3.2% is the cheapest remaining lever in this area.
 
 ## Baseline before this work
 
