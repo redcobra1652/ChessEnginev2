@@ -1708,15 +1708,29 @@ static Move g_countermoves[6][64];
 // this is a single-component (pawn-only) version of Stockfish's multi-
 // component correction history.
 static constexpr int CORRHIST_SIZE  = 16384;  // power of 2
-static constexpr int CORRHIST_LIMIT = 1024;   // cp; generous cap, gravity-bounded in practice
+// Stored value is in internal units, NOT centipawns directly — see
+// corrhist_read(). CORRHIST_GRAIN converts internal units -> cp on read,
+// so the table can converge with fine (sub-1-cp) resolution over many
+// updates while the *applied* correction stays capped at a sane magnitude
+// (CORRHIST_LIMIT / CORRHIST_GRAIN = 128cp at full saturation) instead of
+// being added to static_eval 1:1, which was the bug in the first version
+// of this feature: a saturated ±1024cp swing on the pruning-margin eval
+// wrecked the search (confirmed via SPRT — candidate lost ~every game).
+static constexpr int CORRHIST_LIMIT = 1024;   // internal-unit cap
+static constexpr int CORRHIST_GRAIN = 8;      // internal units per cp
 static int16_t g_pawn_corrhist[2][CORRHIST_SIZE];  // [color][pawn_hash & mask]
 
 static inline int corrhist_index(uint64_t pawn_hash) {
     return (int)(pawn_hash & (CORRHIST_SIZE - 1));
 }
 
+// The cp-scale correction to actually apply to a static eval.
+static inline int corrhist_read(Color c, uint64_t pawn_hash) {
+    return g_pawn_corrhist[c][corrhist_index(pawn_hash)] / CORRHIST_GRAIN;
+}
+
 // Same self-bounding gravity update as hist_update, but with its own limit
-// since correction values are cp-scale, not move-ordering-score-scale.
+// since correction values are internal-unit-scale, not move-ordering-score-scale.
 static inline void corrhist_update(int16_t &h, int bonus) {
     bonus = std::clamp(bonus, -CORRHIST_LIMIT / 4, CORRHIST_LIMIT / 4);
     h += (int16_t)(bonus - (int)h * std::abs(bonus) / CORRHIST_LIMIT);
@@ -2021,7 +2035,7 @@ static int quiescence(Board &board, Accumulator &acc, int alpha, int beta,
     int bucket = get_bucket(board);
     int stand_pat = nnue_eval(acc.stack[acc.top], stm_w, bucket);
     {
-        int corr = g_pawn_corrhist[board.stm][corrhist_index(board.cur.pawn_hash)];
+        int corr = corrhist_read(board.stm, board.cur.pawn_hash);
         stand_pat = std::clamp(stand_pat + corr, -MATE_SCORE + MAX_PLY, MATE_SCORE - MAX_PLY);
     }
     // Refine the raw eval with a compatible TT bound, same idea as in the
@@ -2203,7 +2217,7 @@ static int alpha_beta(Board &board, Accumulator &acc,
     // toward this position's typical (search - static eval) gap, correcting
     // systematic NNUE bias for that structure. See declaration for details.
     if (!in_check) {
-        int corr = g_pawn_corrhist[board.stm][corrhist_index(board.cur.pawn_hash)];
+        int corr = corrhist_read(board.stm, board.cur.pawn_hash);
         static_eval = std::clamp(static_eval + corr, -MATE_SCORE + MAX_PLY, MATE_SCORE - MAX_PLY);
     }
     ss->staticEval  = static_eval;
@@ -2363,6 +2377,12 @@ static int alpha_beta(Board &board, Accumulator &acc,
 
     int  best_score      = -INF;
     Move best_move       = NO_MOVE;
+    // Distinct from best_move: best_move is set on any improvement over the
+    // initial -INF (so it's set by the very first move tried, essentially
+    // always non-NO_MOVE — correct for TT move-ordering hints even at a
+    // fail-low node). The correction-history gate below needs specifically
+    // "did any move raise alpha", which only this tracks.
+    Move alpha_raising_move = NO_MOVE;
     int  orig_alpha      = alpha;
     int  moves_done      = 0;
     int  quiet_count     = 0;   // counts quiet moves tried (for LMP)
@@ -2535,6 +2555,7 @@ static int alpha_beta(Board &board, Accumulator &acc,
             best_score = score;
             best_move  = m;
             if (score > alpha) {
+                alpha_raising_move = m;
                 alpha  = score;
                 pv[0]  = m;
                 if (child_pv_len > 0 && child_pv_len < MAX_PLY - 1)
@@ -2600,17 +2621,24 @@ static int alpha_beta(Board &board, Accumulator &acc,
     // the gap between static eval and what the search actually found.
     // Gated the same way Stockfish gates it: not in check or aborted or a
     // singular-verification call, no mate score (those reflect tactics, not
-    // positional eval bias), best move (if any) isn't a capture (captures
-    // change the pawn structure's context, not informative about *this*
-    // structure), and the error direction matches whether a move improved on
-    // alpha at all — guards against reinforcing noise from an all-pruned
-    // fail-low.
-    bool best_is_capture = best_move != NO_MOVE &&
-        (board.piece_on[move_to(best_move)] != NO_PIECE || move_flags(best_move) == MF_EP);
+    // positional eval bias), the alpha-raising move (if any) isn't a capture
+    // (captures change the pawn structure's context, not informative about
+    // *this* structure), and the error direction matches whether some move
+    // improved on alpha at all — guards against reinforcing noise from an
+    // all-pruned fail-low. Deliberately uses alpha_raising_move, not
+    // best_move: best_move is set by the first move tried regardless of
+    // whether it raised alpha (correct for TT move-ordering hints, wrong
+    // here — using it made this gate always-true and let the table only
+    // ever ratchet upward, confirmed via SPRT: candidate lost ~90% of games).
+    bool alpha_raiser_is_capture = alpha_raising_move != NO_MOVE &&
+        (board.piece_on[move_to(alpha_raising_move)] != NO_PIECE ||
+         move_flags(alpha_raising_move) == MF_EP);
     if (!in_check && !search_aborted && excludedMove == NO_MOVE &&
-        std::abs(best_score) < MATE_SCORE - MAX_PLY && !best_is_capture &&
-        (best_score > ss->staticEval) == (best_move != NO_MOVE)) {
-        int bonus = (best_score - ss->staticEval) * depth / 8;
+        std::abs(best_score) < MATE_SCORE - MAX_PLY && !alpha_raiser_is_capture &&
+        (best_score > ss->staticEval) == (alpha_raising_move != NO_MOVE)) {
+        // bonus is computed in cp, then converted to internal units (see
+        // CORRHIST_GRAIN) before feeding the gravity update.
+        int bonus = (best_score - ss->staticEval) * depth / 8 * CORRHIST_GRAIN;
         corrhist_update(g_pawn_corrhist[board.stm][corrhist_index(board.cur.pawn_hash)], bonus);
     }
 
@@ -2916,7 +2944,10 @@ int main() {
                 }
                 std::cout << '\n';
             }
-            std::cout << (engine.board.stm == WHITE ? "White" : "Black") << " to move\n" << std::flush;
+            std::cout << (engine.board.stm == WHITE ? "White" : "Black") << " to move\n";
+            std::cout << "hash " << std::hex << engine.board.cur.hash
+                      << " pawn_hash " << engine.board.cur.pawn_hash
+                      << std::dec << "\n" << std::flush;
         }
     }
     return 0;
