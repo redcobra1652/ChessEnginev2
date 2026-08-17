@@ -63,8 +63,11 @@ dealings in the software.
 This repository's own restrictive terms above apply only to the author's
 original work. Where this project depends on or is used alongside
 separately-licensed third-party software — for example
-[fastchess](https://github.com/Disservin/fastchess) (vendored in
-`fastchess_src/`) or [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot)
-(cloned locally by `setup_lichess_bot.sh` into `lichess-bot/`, which is
-gitignored and not part of this repository) — those components remain
+[Stockfish](https://github.com/official-stockfish/Stockfish) (GPLv3, used
+locally as a benchmarking opponent, not vendored in this repository — see
+`README.md`), [fastchess](https://github.com/Disservin/fastchess) (vendored
+locally in `fastchess_src/`, gitignored), or
+[lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) (cloned
+locally by `setup_lichess_bot.sh` into `lichess-bot/`, gitignored) — none of
+which are part of this repository — those components remain
 governed by their own respective licenses, not this one.

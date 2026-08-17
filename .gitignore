@@ -1,11 +1,11 @@
 positions.bin
 positions.bin.gz
 checkpoints/*.pt
-stockfish/stockfish-macos-m1-apple-silicon
+stockfish/
 fastchess_src/
 games/
 nnue_engine
-nnue_engine_baseline
+nnue_engine_*
 fastchess
 config.json
 sprt_result.pgn.*
@@ -14,6 +14,7 @@ profile.txt
 net_eval_diagnostic_results.csv
 __pycache__/
 *.pgn
+*.log
 sprt_result.pgn
 .DS_Store
 lichess-bot/

@@ -62,7 +62,7 @@ just make sure `NNFile` gets set before the first `go`.
 
 - `python3 -m pip install -r <none needed — bench.py/tournament.py use only python-chess>` — `pip install chess` if you don't already have it.
 - `./fastchess` (built from `fastchess_src/`, a vendored copy of [Disservin/fastchess](https://github.com/Disservin/fastchess)) drives SPRT-style engine-vs-engine testing; `openings.epd` is the opening book used. See CLAUDE.md's "SPRT harness" section for example commands and the operational lessons learned running them (always rebuild `nnue_engine_baseline` after a change lands, always run a 40-game sanity check before a real SPRT, etc.).
-- `bench.py`/`tournament.py` — Python-based benchmarking against a bundled Stockfish binary (`stockfish/`); CLAUDE.md documents why fastchess-based SPRT results are more trustworthy than this path's numbers.
+- `bench.py`/`tournament.py` — Python-based benchmarking against a local Stockfish build. Stockfish (GPLv3) is not vendored in this repository — build or download it yourself into `stockfish/` (same treatment as `fastchess`/`lichess-bot`: a separate tool this project tests against, not part of it). CLAUDE.md documents why fastchess-based SPRT results are more trustworthy than this path's numbers.
 
 ## Publishing on Lichess
 
