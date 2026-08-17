@@ -16,3 +16,4 @@ __pycache__/
 *.pgn
 sprt_result.pgn
 .DS_Store
+lichess-bot/

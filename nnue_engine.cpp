@@ -55,6 +55,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <climits>
@@ -66,6 +67,7 @@
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <pthread.h>
 #include <string>
 #include <vector>
 
@@ -1734,17 +1736,21 @@ static void tt_store(uint64_t key, int depth, int score, uint8_t flag, Move mv) 
 static constexpr int HIST_MAX = 16384;
 
 // ButterflyHistory [color][from*64+to]
-static int16_t g_main_history[2][64 * 64];
+// thread_local: each search thread keeps its own copy (Lazy SMP style — only
+// the TT is truly shared between threads). Measured cost of thread_local vs.
+// a global here: within noise (<2% NPS) on this platform — see the session
+// that introduced multithreading for the measurement.
+static thread_local int16_t g_main_history[2][64 * 64];
 
 // ContinuationHistory [inCheck(0/1)][piece(0..5)][to][prev_piece(0..5)][prev_to]
 // Covers 1-ply and 2-ply continuation contexts; indexed by (ss-1) and (ss-2).
-static int16_t g_cont_history[2][6][64][6][64];
+static thread_local int16_t g_cont_history[2][6][64][6][64];
 
 // CapturePieceToHistory [attacker_piece][to][captured_piece]
-static int16_t g_capture_history[6][64][6];
+static thread_local int16_t g_capture_history[6][64][6];
 
 // Countermove table [piece_type][to_square] → best reply to that move
-static Move g_countermoves[6][64];
+static thread_local Move g_countermoves[6][64];
 
 // ── Pawn correction history ─────────────────────────────────────────────────
 // Tracks the running average gap between static eval and search result,
@@ -1765,7 +1771,7 @@ static constexpr int CORRHIST_SIZE  = 16384;  // power of 2
 // wrecked the search (confirmed via SPRT — candidate lost ~every game).
 static constexpr int CORRHIST_LIMIT = 1024;   // internal-unit cap
 static constexpr int CORRHIST_GRAIN = 8;      // internal units per cp
-static int16_t g_pawn_corrhist[2][CORRHIST_SIZE];  // [color][pawn_hash & mask]
+static thread_local int16_t g_pawn_corrhist[2][CORRHIST_SIZE];  // [color][pawn_hash & mask]
 
 static inline int corrhist_index(uint64_t pawn_hash) {
     return (int)(pawn_hash & (CORRHIST_SIZE - 1));
@@ -1801,7 +1807,7 @@ struct SearchStack {
     int  checkExtensions = 0;
 };
 
-static Move g_killers[MAX_PLY][2];
+static thread_local Move g_killers[MAX_PLY][2];
 
 // SF-style gravity update: h += bonus - h*|bonus|/MAX
 static inline void hist_update(int16_t &h, int bonus) {
@@ -1823,14 +1829,21 @@ static void history_clear() {
     g_tt_age = 0;
 }
 
-// Called at the start of every search — only reset killers, which are
-// ply-indexed and meaningless across searches.  History tables accumulate
-// across moves in the same game; clearing them every move was throwing away
-// all learned ordering information (major Elo loss).
 // g_tt_age increments each search so TT eviction prefers stale entries.
+// Called once per `go`, by the orchestrating thread only, before any search
+// thread is launched — g_tt_age is shared TT bookkeeping, not per-thread
+// state, so it must be bumped exactly once regardless of Threads count.
 static void search_init() {
-    memset(g_killers, 0, sizeof g_killers);
     g_tt_age++;
+}
+// Called once per search thread (main and every Lazy SMP helper) at the
+// start of its own iterate() — resets that thread's killers, which are
+// ply-indexed and meaningless across searches. History tables accumulate
+// across moves in the same game and are per-thread (thread_local); clearing
+// them every move was throwing away all learned ordering information (major
+// Elo loss) — same reasoning as before, now per-thread instead of global.
+static void search_init_thread() {
+    memset(g_killers, 0, sizeof g_killers);
 }
 
 static void killer_store(int ply, Move m) {
@@ -1985,13 +1998,28 @@ static inline void pick_next(ScoredMove *ms, int start, int n) {
 // ─────────────────────────── Timing ────────────────────────────────────────
 
 using Clock = std::chrono::steady_clock;
+// Shared across all search threads: written once by the orchestrating thread
+// before any worker thread is launched, then read-only for the duration of
+// the search (safe without atomics — pthread_create() establishes a
+// happens-before edge for the launching thread's prior writes).
 static Clock::time_point g_start_time;
 static int64_t           g_time_limit_ms;  // -1 = no limit
 static int64_t           g_node_limit;     // -1 = no limit
-static int64_t           g_nodes;
-static int               g_root_history_size = 0;
+static int64_t           g_soft_limit_ms = -1;  // -1 = disabled (fixed movetime/depth/infinite searches)
+static int               g_num_threads = 1;     // set via UCI "setoption name Threads"
 
-static bool g_stop = false;   // set by UCI "stop"; cleared at start of each search
+// Per-thread: each search thread (Lazy SMP worker) tracks its own node count
+// and time-poll bookkeeping. Node totals across threads are summed only when
+// reporting (see the "go" handler) — never read cross-thread during search.
+static thread_local int64_t g_nodes;
+static thread_local int    g_root_history_size = 0;
+
+// Shared stop flag: every thread must observe the same signal so they all
+// stop together (set by UCI "stop", by the time budget, or by one thread
+// hitting the node limit). Relaxed ordering is enough — this is a liveness
+// flag, not a data-carrying variable, and every thread already re-checks its
+// own g_nodes/elapsed_ms() before trusting anything gated on it.
+static std::atomic<bool> g_stop{false};
 
 static int64_t elapsed_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g_start_time).count();
@@ -2001,11 +2029,12 @@ static int64_t elapsed_ms() {
 // sampled the clock, so the UCI loop can report the gap between that last
 // poll and when search() finally returned. A large gap localizes the
 // overrun to an unpolled stretch of code; a small gap means the overrun is
-// elsewhere (allocation, output, or the budget itself).
-static int64_t g_soft_limit_ms = -1;    // -1 = disabled (fixed movetime/depth/infinite searches)
-static int64_t g_last_poll_ms = 0;      // elapsed_ms() at the most recent poll
-static int64_t g_prev_poll_ms = 0;      // elapsed_ms() at the poll before that
-static int64_t g_max_poll_gap_ms = 0;   // largest observed gap between consecutive polls this search
+// elsewhere (allocation, output, or the budget itself). thread_local because
+// each search thread polls independently; NNUE_TIME_DEBUG reporting reflects
+// only the main (reporting) thread's poll gaps.
+static thread_local int64_t g_last_poll_ms = 0;      // elapsed_ms() at the most recent poll
+static thread_local int64_t g_prev_poll_ms = 0;      // elapsed_ms() at the poll before that
+static thread_local int64_t g_max_poll_gap_ms = 0;   // largest observed gap between consecutive polls this search
 static bool g_time_debug = false;  // set once in main() from NNUE_TIME_DEBUG env var
 
 // ── Pruning firing-rate / depth-distribution instrumentation ────────────
@@ -2015,36 +2044,40 @@ static bool g_time_debug = false;  // set once in main() from NNUE_TIME_DEBUG en
 // mechanism is saturated vs. leaving nodes on the table, post the
 // output-layer quantization fix (the pre-fix firing-rate numbers in
 // CLAUDE.md were measured against a badly-distorted eval and are stale).
+// thread_local, like the history tables above: with Threads>1 each search
+// thread accumulates its own counts, and "prunestats" (see the UCI loop)
+// reports whichever thread services the debug command — normally used with
+// Threads=1 for analysis, so this doesn't need cross-thread summation.
 static bool g_prune_debug = false;  // set once in main() from NNUE_PRUNE_DEBUG env var
-static int64_t g_nonleaf_nodes = 0;
-static int64_t g_nodes_by_depth[64] = {0};
-static int64_t g_rfp_checked = 0, g_rfp_hits = 0;
-static int64_t g_nmp_checked = 0, g_nmp_hits = 0;
-static int64_t g_probcut_checked = 0, g_probcut_hits = 0;
-static int64_t g_futility_skips = 0;
-static int64_t g_lmp_skips = 0;
-static int64_t g_histprune_skips = 0;
+static thread_local int64_t g_nonleaf_nodes = 0;
+static thread_local int64_t g_nodes_by_depth[64] = {0};
+static thread_local int64_t g_rfp_checked = 0, g_rfp_hits = 0;
+static thread_local int64_t g_nmp_checked = 0, g_nmp_hits = 0;
+static thread_local int64_t g_probcut_checked = 0, g_probcut_hits = 0;
+static thread_local int64_t g_futility_skips = 0;
+static thread_local int64_t g_lmp_skips = 0;
+static thread_local int64_t g_histprune_skips = 0;
 // Depth-bucketed breakdown: pooling RFP's hit rate across depth 1-8 is
 // meaningless because its margin (234*(depth-improving)) varies 8x across
 // that range (0 at depth 1/improving, up to 1872 at depth 8/non-improving).
 // These arrays answer "which depth band is actually restrictive" instead.
-static int64_t g_rfp_checked_by_depth[64] = {0}, g_rfp_hits_by_depth[64] = {0};
-static int64_t g_futility_skips_by_depth[64] = {0};
-static int64_t g_lmp_skips_by_depth[64] = {0};
+static thread_local int64_t g_rfp_checked_by_depth[64] = {0}, g_rfp_hits_by_depth[64] = {0};
+static thread_local int64_t g_futility_skips_by_depth[64] = {0};
+static thread_local int64_t g_lmp_skips_by_depth[64] = {0};
 // Simulated RFP hit-rate at several candidate margin coefficients (in place
 // of 234), computed alongside the real (unchanged) 234 check -- answers "how
 // much node mass would newly be pruned by a tighter coefficient" without
 // needing a full near-miss histogram or actually changing search behavior.
 static constexpr int RFP_CANDIDATE_COEFS[] = {234, 200, 180, 165, 150, 120, 100, 80};
 static constexpr int N_RFP_CANDIDATES = sizeof(RFP_CANDIDATE_COEFS) / sizeof(int);
-static int64_t g_rfp_hits_at_coef[N_RFP_CANDIDATES] = {0};
+static thread_local int64_t g_rfp_hits_at_coef[N_RFP_CANDIDATES] = {0};
 // Same simulation, broken out by remaining depth -- the flat version above is
 // dominated by depth-1 node mass (44% of all nonleaf nodes), where margin is
 // already 0 whenever improving==true regardless of coefficient. This answers
 // the actual decision question: does a tighter coefficient gain anything in
 // the depth 2-4 band (~48% of node mass, margin 234-702cp, genuinely
 // restrictive) specifically, not just in aggregate.
-static int64_t g_rfp_hits_at_coef_by_depth[N_RFP_CANDIDATES][64] = {{0}};
+static thread_local int64_t g_rfp_hits_at_coef_by_depth[N_RFP_CANDIDATES][64] = {{0}};
 
 static void prune_stats_reset() {
     g_nonleaf_nodes = 0;
@@ -2062,7 +2095,7 @@ static void prune_stats_reset() {
 }
 
 static bool out_of_time() {
-    if (g_stop) return true;
+    if (g_stop.load(std::memory_order_relaxed)) return true;
     if (g_node_limit >= 0 && g_nodes >= g_node_limit) return true;
     if (g_time_limit_ms >= 0 && (g_nodes & 4095) == 0) {
         g_prev_poll_ms = g_last_poll_ms;
@@ -2794,7 +2827,6 @@ static int alpha_beta(Board &board, Accumulator &acc,
 
 struct Engine {
     Board       board;
-    Accumulator acc;
     std::string nn_file;
 
     Engine() { board.set_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"); }
@@ -2804,32 +2836,27 @@ struct Engine {
         load_nnue(path);
     }
 
-    // soft_limit_ms: the "normal" time allocation for this move — once used
-    // up, iterative deepening won't start another depth unless the best
-    // move has been unstable (see below). -1 disables soft-limit early exit
-    // (fixed `go movetime`/`go depth`/`go infinite` — those should use the
-    // full hard limit, not stop early). hard_limit_ms is the absolute cap
-    // (what out_of_time() enforces, same role the old single `movetime_ms`
-    // parameter played) — for -1 soft_limit_ms callers, hard_limit_ms is
-    // that same fixed budget.
-    std::pair<Move,int> search(int depth, int64_t soft_limit_ms, int64_t hard_limit_ms) {
-        if (!g_weights.loaded) {
-            Move moves[MAX_MOVES];
-            int n = board.gen_moves(moves);
-            return {n > 0 ? moves[0] : NO_MOVE, 0};
-        }
+    // Runs one thread's iterative-deepening loop on its own private copy of
+    // the position (`board` taken by value — Lazy SMP: every search thread,
+    // main and helpers alike, gets an independent Board+Accumulator; the
+    // only state genuinely shared between threads is the TT, plus the
+    // read-only-during-search time/stop globals set by search() before any
+    // thread is launched). `report` gates the "info depth ..." stdout lines
+    // and the out-params — only the main thread's result is used as the
+    // engine's actual move; helper threads search purely to warm the shared
+    // TT and are otherwise silent, per the standard Lazy SMP design (no
+    // cross-thread best-move voting in this version).
+    static void iterate(Board board, int depth, int64_t soft_limit_ms, bool report,
+                         Move &out_best_move, int &out_best_score) {
+        search_init_thread();
 
-        g_stop          = false;
-        g_start_time    = Clock::now();
-        g_time_limit_ms = hard_limit_ms;
-        g_soft_limit_ms = soft_limit_ms;
-        g_nodes         = 0;
-        g_last_poll_ms  = 0;
-        g_prev_poll_ms  = 0;
-        g_max_poll_gap_ms = 0;
-
-        search_init();
+        Accumulator acc;
         acc.reset(board);
+
+        g_nodes            = 0;
+        g_last_poll_ms      = 0;
+        g_prev_poll_ms      = 0;
+        g_max_poll_gap_ms   = 0;
 
         Move best_move  = NO_MOVE;
         int  best_score = 0;
@@ -2855,16 +2882,16 @@ struct Engine {
         // limit a bit — an unstable position is exactly when cutting the
         // search short is most likely to return the wrong move. Always
         // capped by the hard limit via out_of_time().
-        int64_t effective_soft = g_soft_limit_ms;
+        int64_t effective_soft = soft_limit_ms;
 
         for (int d = 1; d <= depth; d++) {
             if (out_of_time()) break;
             // Soft-limit early exit: once the normal allocation for this
             // move is used up and the line hasn't been unstable, don't
             // start another iteration. Only active for wtime/btime-derived
-            // budgets (g_soft_limit_ms >= 0) — fixed `go movetime`/`go
+            // budgets (soft_limit_ms >= 0) — fixed `go movetime`/`go
             // depth`/`go infinite` searches use the full hard limit.
-            if (g_soft_limit_ms >= 0 && d > 1 && elapsed_ms() >= effective_soft) break;
+            if (soft_limit_ms >= 0 && d > 1 && elapsed_ms() >= effective_soft) break;
 
             Move iter_pv[MAX_PLY]; int iter_pv_len = 0;
             int score;
@@ -2911,7 +2938,7 @@ struct Engine {
                 // Instability: the best move changed from the previous
                 // completed iteration. Ignore the shallow depths, where this
                 // is just noise rather than a signal worth reacting to.
-                if (g_soft_limit_ms >= 0 && d >= 5 &&
+                if (soft_limit_ms >= 0 && d >= 5 &&
                     best_move != NO_MOVE && iter_pv[0] != best_move) {
                     effective_soft = std::min(g_time_limit_ms,
                                                (int64_t)(effective_soft * 1.3));
@@ -2923,20 +2950,22 @@ struct Engine {
                 pv_len = iter_pv_len;
             }
 
-            int64_t t_ms = elapsed_ms();
-            int64_t nps  = (t_ms > 0) ? g_nodes * 1000 / t_ms : g_nodes;
-            std::string pv_str;
-            for (int i = 0; i < std::min(pv_len, 6); i++) {
-                if (i) pv_str += ' ';
-                pv_str += board.move_uci(pv[i]);
+            if (report) {
+                int64_t t_ms = elapsed_ms();
+                int64_t nps  = (t_ms > 0) ? g_nodes * 1000 / t_ms : g_nodes;
+                std::string pv_str;
+                for (int i = 0; i < std::min(pv_len, 6); i++) {
+                    if (i) pv_str += ' ';
+                    pv_str += board.move_uci(pv[i]);
+                }
+                std::cout << "info depth " << d
+                          << " score cp " << best_score
+                          << " nodes "    << g_nodes
+                          << " nps "      << nps
+                          << " time "     << t_ms
+                          << " pv "       << pv_str
+                          << "\n" << std::flush;
             }
-            std::cout << "info depth " << d
-                      << " score cp " << best_score
-                      << " nodes "    << g_nodes
-                      << " nps "      << nps
-                      << " time "     << t_ms
-                      << " pv "       << pv_str
-                      << "\n" << std::flush;
         }
 
         if (best_move == NO_MOVE) {
@@ -2944,7 +2973,93 @@ struct Engine {
             int n = board.gen_moves(moves);
             if (n) best_move = moves[0];
         }
+        out_best_move  = best_move;
+        out_best_score = best_score;
+    }
+
+    // soft_limit_ms: the "normal" time allocation for this move — once used
+    // up, iterative deepening won't start another depth unless the best
+    // move has been unstable (see below). -1 disables soft-limit early exit
+    // (fixed `go movetime`/`go depth`/`go infinite` — those should use the
+    // full hard limit, not stop early). hard_limit_ms is the absolute cap
+    // (what out_of_time() enforces, same role the old single `movetime_ms`
+    // parameter played) — for -1 soft_limit_ms callers, hard_limit_ms is
+    // that same fixed budget.
+    //
+    // Lazy SMP: spawns (Threads-1) helper threads, each running its own
+    // independent iterate() call sharing only the TT and the time/stop
+    // globals below (set here, before any thread starts, then read-only for
+    // the duration of the search). The calling thread runs its own iterate()
+    // as the "main" (reporting) thread; its result is the one returned. See
+    // CLAUDE.md's multithreading section for the design rationale.
+    std::pair<Move,int> search(int depth, int64_t soft_limit_ms, int64_t hard_limit_ms) {
+        if (!g_weights.loaded) {
+            Move moves[MAX_MOVES];
+            int n = board.gen_moves(moves);
+            return {n > 0 ? moves[0] : NO_MOVE, 0};
+        }
+
+        g_stop.store(false, std::memory_order_relaxed);
+        g_start_time    = Clock::now();
+        g_time_limit_ms = hard_limit_ms;
+        g_soft_limit_ms = soft_limit_ms;
+
+        search_init();  // shared TT-age bump — once per `go`, not once per thread
+
+        int nthreads = std::max(1, g_num_threads);
+
+        // macOS (and several other libc's) give a plain std::thread/pthread
+        // only a ~512KB default stack, vs. ~8MB for the process's main
+        // thread — confirmed by measurement on this platform (8176KB vs.
+        // 524KB) and by a real crash: the first Lazy SMP SPRT run hit a
+        // helper-thread SIGBUS ("Thread stack size exceeded due to
+        // excessive recursion") inside alpha_beta's normal recursion depth,
+        // something 100+ single-threaded games never triggered because the
+        // main thread's stack was always large enough. Explicit
+        // pthread_attr_setstacksize (used directly instead of std::thread,
+        // which has no portable way to request a non-default stack size)
+        // gives every helper thread the same generous stack the main
+        // thread already had.
+        static constexpr size_t HELPER_STACK_SIZE = 16 * 1024 * 1024;
+
+        std::vector<pthread_t> helpers;
+        helpers.reserve(nthreads - 1);
+        std::vector<HelperArgs> helper_args(nthreads > 0 ? nthreads - 1 : 0);
+        for (int i = 1; i < nthreads; i++) {
+            helper_args[i - 1] = {this, depth, soft_limit_ms};
+
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, HELPER_STACK_SIZE);
+
+            pthread_t tid;
+            pthread_create(&tid, &attr, &Engine::helper_thread_main, &helper_args[i - 1]);
+            pthread_attr_destroy(&attr);
+            helpers.push_back(tid);
+        }
+
+        Move best_move  = NO_MOVE;
+        int  best_score = 0;
+        iterate(board, depth, soft_limit_ms, /*report=*/true, best_move, best_score);
+
+        for (pthread_t tid : helpers) pthread_join(tid, nullptr);
+
         return {best_move, best_score};
+    }
+
+private:
+    struct HelperArgs {
+        Engine  *engine;
+        int      depth;
+        int64_t  soft_limit_ms;
+    };
+
+    static void *helper_thread_main(void *raw) {
+        HelperArgs *args = static_cast<HelperArgs *>(raw);
+        Move discard_move; int discard_score;
+        iterate(args->engine->board, args->depth, args->soft_limit_ms,
+                /*report=*/false, discard_move, discard_score);
+        return nullptr;
     }
 };
 
@@ -2965,7 +3080,7 @@ int main() {
     std::cout << "id name NNUEEngine\nid author nnue-trainer\n";
     std::cout << "option name NNFile type string default <empty>\n";
     std::cout << "option name Hash type spin default 128 min 1 max 2048\n";
-    std::cout << "option name Threads type spin default 1 min 1 max 1\n";
+    std::cout << "option name Threads type spin default 1 min 1 max 64\n";
     std::cout << "uciok\n" << std::flush;
 
     int    depth      = 64;
@@ -2980,7 +3095,7 @@ int main() {
             std::cout << "id name NNUEEngine\nid author nnue-trainer\n";
             std::cout << "option name NNFile type string default <empty>\n";
             std::cout << "option name Hash type spin default 128 min 1 max 2048\n";
-            std::cout << "option name Threads type spin default 1 min 1 max 1\n";
+            std::cout << "option name Threads type spin default 1 min 1 max 64\n";
             std::cout << "uciok\n" << std::flush;
 
         } else if (cmd == "isready") {
@@ -3002,6 +3117,9 @@ int main() {
             }
             if (name == "Hash") {
                 tt_resize(std::stoi(value));
+            }
+            if (name == "Threads") {
+                g_num_threads = std::max(1, std::stoi(value));
             }
 
         } else if (cmd == "position") {
@@ -3122,9 +3240,10 @@ int main() {
             if (!g_weights.loaded) {
                 std::cout << "info string no net loaded\n" << std::flush;
             } else {
-                engine.acc.reset(engine.board);
+                Accumulator acc;
+                acc.reset(engine.board);
                 int bkt = get_bucket(engine.board);
-                int ev  = nnue_eval(engine.acc.stack[engine.acc.top],
+                int ev  = nnue_eval(acc.stack[acc.top],
                                     engine.board.stm == WHITE, bkt);
                 std::cout << "eval " << ev << " bucket " << bkt << "\n" << std::flush;
             }

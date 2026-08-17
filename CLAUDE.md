@@ -1023,3 +1023,293 @@ whether it worked. Decide first whether multi-threaded strength is actually
 part of the goal; if so, the benchmark needs redesigning (a threaded
 opponent, a threaded anchor) before writing any thread-safety code, not
 after.
+
+## Session follow-up: is search depth the ceiling, and is pruning too conservative to reach it?
+
+The user asked directly: is it worth pruning more aggressively, and how do
+we get this engine searching deeper — is depth the actual Elo ceiling right
+now? Answered with real measurement, not the n=5–6-position spot-checks
+used earlier in this document, per explicit instruction to test at scale
+("thousands of positions," not five).
+
+### Depth is confirmed to be a large, real lever
+
+Doubled the per-move time budget (`tc=8+0.08` → `tc=16+0.16`, otherwise
+identical binaries) and played it out for real, twice:
+
+- First attempt (`depth_value_sprt.log`) ran at `-concurrency 4`
+  *simultaneously* with an unrelated position-sweep job competing for the
+  same cores — contaminated by resource contention, discarded. (H0
+  accepted at 36 games, Elo −203.97 ± 99.07 — direction was right but the
+  magnitude isn't trustworthy given the contention.)
+- Clean re-run (`clean_depth_value.log`/`.pgn`, `-concurrency 2`, no
+  competing jobs, fixed 200 games, zero forfeits/time losses verified):
+  **Elo: −143.07 ± 34.51** for the faster (8+0.08) side, 16W–94L–90D,
+  30.50% score. I.e. **one doubling of thinking time is worth about +143
+  Elo** at this engine's current strength. This confirms the premise:
+  depth (search time, at fixed search quality) is currently the single
+  biggest lever available, well above anything a pruning-margin tweak
+  could plausibly deliver on its own.
+
+### Node-mass-by-depth measurement: extending pruning to *higher* depths is not the way there
+
+Built new, checked-in instrumentation (`nnue_engine.cpp`, commit
+`3212cb5`) to answer "where do search nodes actually live, and how often
+does each pruning technique fire, at real game positions and a realistic
+time budget" — env-var-gated (`NNUE_PRUNE_DEBUG=1`), zero behavior/perf
+cost when unset, exposed via a new `prunestats` / `prunestats reset` UCI
+debug command (mirrors the existing `NNUE_TIME_DEBUG`/`eval` pattern).
+Tracks: nonleaf node count by remaining depth, RFP/NMP/ProbCut
+checked-vs-hit counts (including a depth-bucketed breakdown and a
+simulated hit-count at 8 candidate RFP margin coefficients, so different
+coefficients can be compared from one sweep without rebuilding), futility/
+LMP/history-prune skip counts by depth.
+
+Ran this across **3,903 real-game positions** (deduped FENs, ply 10–70,
+not in check, sampled from `games/vs_sf2750.pgn`; positions decided by
+`|eval| > 600cp` skipped as uninformative), 330ms/move (the `tc=8+0.08`
+anchor's typical per-move budget), **543M total nonleaf nodes** measured.
+
+**Finding: node mass is heavily concentrated at shallow remaining depth —
+extending any pruning technique's depth cap higher would touch almost no
+nodes.**
+
+- 92%+ of all nonleaf nodes sit at remaining depth ≤ 4.
+- Only **0.63%** of nonleaf nodes occur at remaining depth ≥ 9 (RFP's
+  current cutoff, `depth<9`) — raising that cap, or LMP's `depth<=8` cap,
+  to cover more of the tree literally cannot move the needle; there's
+  almost nothing left up there to prune.
+
+This directly refutes the "prune more aggressively by reaching further up
+the tree" framing — the pruning caps already cover essentially all the
+node mass. **The lever, if there is one, is tightening pruning where the
+nodes already are (shallow remaining depth), not extending pruning's
+reach.**
+
+### RFP margin coefficient: a depth-isolated, real signal — but pruning more aggressively is a mixed bag, not a free win
+
+RFP's margin coefficient (`static_eval - 234 * (depth - improving) >=
+beta`) is `234`, ported from generic Stockfish source, never tuned against
+this net (flagged as an open gap in this document's own earlier "Is it
+worth pruning more aggressively now that the eval is trustworthy?"
+section). Simulated 8 candidate coefficients (234 down to 80) against the
+same sweep data.
+
+**First pass (aggregate, not depth-bucketed) looked like a small effect —
+this was an analysis artifact, not the real signal.** ~44% of all node
+mass sits at remaining depth 1, where RFP's margin is already 0 whenever
+`improving=true` regardless of coefficient — diluting any aggregate
+comparison. Re-ran depth-bucketed: isolated to the remaining-depth 2–4
+band (48% of all node mass, where the margin is actually restrictive at
+234–702cp), coefficient **165** (chosen because it's within Stockfish's
+own historically-tuned range, not an arbitrary pick) fires **+8.77
+percentage points** more often than the current 234 — a real, substantial,
+depth-isolated effect, not noise.
+
+**But "fires more often" is not the same as "is stronger" — a tighter RFP
+margin also means more false-positive prunes (real threats missed because
+the shallow-search verification never runs the tactics deeply enough to
+see them).** This is exactly the same class of tradeoff this document
+already resolved once, for `CHECK_EXT_BUDGET`: more pruning/fewer nodes
+is not automatically more Elo, and mid-run SPRT trends on a small effect
+are not trustworthy (see the `CHECK_EXT_BUDGET=24` cautionary tale
+earlier in this document — it looked like +9–17 Elo at 700–1100 games and
+decayed to +3.82±12.05/LLR≈0 by 1660 games). So this was taken to game
+testing, per the project's established protocol, not adopted on the
+node-count signal alone.
+
+**Result: inconclusive — not a confirmed win, not a confirmed loss, no
+production change made.**
+
+- Built `nnue_engine_rfp165_candidate` (one-line change,
+  `234` → `165`, from a scratch copy — never applied to the committed
+  `nnue_engine.cpp`).
+- **40-game sanity check passed cleanly**: `sanity_rfp165.log`,
+  tc=8+0.08, concurrency=4 — Elo 70.44 ± 78.35, 14W–6L–20D, 60.00% score,
+  LOS 96.75%. No red flags, cleared to proceed to a real SPRT per the
+  project's "Operational lessons" protocol.
+- **Real SPRT (`elo0=0 elo1=10`, tc=8+0.08, concurrency=4) did not
+  resolve — it crashed.** `sprt_rfp165.log`: ran cleanly to 306 finished
+  games (Elo 6.95 ± 29.13, LLR 0.11, only ~3.7% of the way to the +10
+  Elo bound — nowhere near either bound, indistinguishable from zero at
+  this sample size), then **game 308 ended in `{White disconnects}`** and
+  fastchess halted the tournament ("stalled / disconnected and no recover
+  option set for engine, stopping tournament"). This has not been
+  root-caused — could be a real engine crash under sustained concurrent
+  load (worth checking for before trusting either binary further), or an
+  environment/resource hiccup unrelated to search logic. **Don't treat
+  this candidate as tested-and-rejected or tested-and-accepted — it's
+  simply unresolved.** Whoever picks this up next should: (1) check
+  whether the disconnect reproduces (rerun with `-recover`, or grep
+  stderr/core dumps around game 308 in this log for a crash signature),
+  and (2) if the engines are stable, resume/extend the SPRT
+  (`./fastchess -config file=config.json` per the log's own suggestion,
+  or relaunch fresh) until LLR actually crosses a bound — per this
+  document's own established discipline, a point estimate this close to
+  zero this early is not a result to act on either way.
+- **The live engine is unchanged**: `nnue_engine.cpp`'s RFP coefficient is
+  still `234` at HEAD (`3212cb5`); the only committed change this session
+  was the `prunestats` instrumentation itself, which is purely additive
+  and does not alter engine behavior when `NNUE_PRUNE_DEBUG` is unset.
+  No SPRT-confirmed Elo change from this session — the Stockfish@2750
+  anchor table at the top of this document is still current and
+  unchanged.
+
+### Net takeaway
+
+Depth is confirmed to be the dominant lever (+143 Elo per time-doubling,
+measured cleanly). Extending pruning to reach *higher* remaining depths is
+ruled out (almost no node mass lives there). Tightening RFP's margin at
+the depths that actually matter (2–4) is a plausible, cheap, defensible
+next test — the depth-isolated node-count signal is real — but is not yet
+an Elo win; it needs a clean, uninterrupted SPRT run to actually resolve
+one way or the other before being adopted or discarded.
+
+## Multithreading (Lazy SMP) — implemented, one real bug found and fixed, internal SPRT strongly positive but not formally resolved
+
+Item 5 from the prioritized list above (previously "deliberately deferred")
+is now implemented. Trigger: the RFP-margin experiment above turned out to
+be a dead end (inconclusive, then an unrelated crash), and the user asked
+directly whether multithreading was worth doing instead, with the explicit
+goal of moving the Stockfish@2750 anchor forward. Decision made with the
+user up front: the target number is **engine at N threads vs. Stockfish@2750
+at 1 thread**, tracked as a new anchor row *alongside* the existing
+single-thread row, not replacing it — re-measuring that anchor is still
+open, see "What's left" below.
+
+### Design
+
+Standard Lazy SMP: every search thread (main + helpers) gets its own
+independent `Board`/`Accumulator`/`SearchStack`/history tables; the **only**
+state genuinely shared between threads is the transposition table.
+
+- `g_main_history`, `g_cont_history`, `g_capture_history`, `g_countermoves`,
+  `g_pawn_corrhist`, `g_killers`, and the per-thread node/timing counters are
+  all `thread_local`. Measured the cost of this before committing to it
+  (converting just `g_main_history` and comparing NPS against a global):
+  <2% difference, within noise — so this was the right call over a
+  Worker-struct-and-thread-a-pointer-through-everything refactor, which
+  would have touched ~8-10 function signatures for no measurable benefit.
+- The TT (`g_tt`) is shared with no locking — the standard lockless-SMP
+  design. Traced through the actual code before trusting this: a torn read
+  across threads can hand `score_moves`/`singular_ext` a garbage `tt_move`,
+  but that value is only ever used for a `==` comparison against moves from
+  a *freshly generated* legal move list (`board.gen_moves`) — it is never
+  `do_move`'d directly. The one place a raw `tt_move` gets written into a
+  `pv[]` array without that check (`alpha_beta`'s `TT_EXACT` early return)
+  is gated to `!is_pv` nodes, which never includes the root's real PV chain.
+  So a torn TT read can waste an ordering hint or corrupt a discarded
+  non-root display string, never produce an illegal move or corrupt the
+  actual chosen move. Confirmed empirically too: a ThreadSanitizer build run
+  under real 4-thread search found races *only* inside `tt_store`/TT-entry
+  reads — zero races anywhere in the history tables, confirming the
+  `thread_local` conversion has no leaks.
+- `g_stop` is `std::atomic<bool>` (relaxed ordering — it's a liveness flag,
+  every thread already re-polls its own node count/clock before trusting
+  anything gated on it). `g_start_time`/`g_time_limit_ms`/`g_soft_limit_ms`
+  are set once by the orchestrating thread *before* any worker is launched,
+  then read-only for the search's duration — safe without atomics.
+- No persistent thread pool: helper threads are spawned and joined once per
+  `go`. Deliberate tradeoff, not an oversight — this means helper threads'
+  history tables restart cold every move (only the main thread's history
+  persists across the whole game), which is a real but expected-to-be-modest
+  quality cost, accepted in exchange for a much simpler implementation.
+  Revisit only if a future measurement suggests it actually matters.
+- New `Threads` UCI option (was hardcoded `min 1 max 1`; now `min 1 max 64`).
+
+### Bug found: helper threads were crashing (stack overflow), caught by the first real SPRT attempt
+
+`std::thread`'s default stack size is platform-dependent and, on this
+machine, dramatically smaller for a spawned thread than for the process's
+main thread — measured directly: **8176KB for main vs. 524KB for a plain
+worker thread**. `alpha_beta`'s ordinary recursion depth fits comfortably in
+8MB but overflowed the 512KB helper-thread stack. This is exactly why 100+
+single-threaded games across this whole project never surfaced it: the main
+thread always had the big stack. The first Lazy SMP SPRT attempt hit this
+within the first ~10 games (macOS crash reporter: `nnue_engine_mt4_candidate`,
+`EXC_BAD_ACCESS` / `SIGBUS`, "Thread stack size exceeded due to excessive
+recursion", deep inside `alpha_beta`'s own recursion).
+
+**Fix**: replaced `std::thread` with raw `pthread_create` +
+`pthread_attr_setstacksize(16MB)` for helper threads (`std::thread` has no
+portable way to request a non-default stack size). Verified: 10 games at
+Threads=8 post-fix, zero new crash reports (macOS `DiagnosticReports`,
+checked directly, not inferred) vs. 2 crashes in ~7 games pre-fix.
+
+**Lesson for future sessions**: a short TSan run or a handful of manual
+`go movetime` probes at high thread counts is not sufcient to catch this
+class of bug — it needs enough real recursion depth (a real game, not a
+800ms-1s smoke test) to actually exhaust a small stack. Any future change
+to per-node stack usage (larger `SearchStack`, bigger move-ordering arrays,
+etc.) should be re-checked against this 16MB budget, not assumed safe
+because single-threaded testing passed.
+
+### Internal SPRT result: strongly positive, stopped before formal resolution
+
+`nnue_engine` (Threads=4) vs. `nnue_engine_baseline` (Threads=1, this
+project's normal single-threaded state), `tc=8+0.08`, `-concurrency 1`
+(required — Threads=4 candidate + Threads=1 baseline + any additional
+concurrent game pair would oversubscribe this machine's 10 cores and
+invalidate the comparison), `elo0=0 elo1=30`, `-recover` enabled.
+
+Stopped by explicit user request at 108 games (100-game checkpoint is the
+last full stats block):
+
+| Games | Elo | LOS | LLR (of the way to +30 bound) |
+|---|---|---|---|
+| 60 | +58.45 ± 65.47 | 96.45% | 31.7% |
+| 80 | +70.44 ± 61.90 | 98.98% | 47.0% |
+| 100 | **+99.95 ± 58.05** | **99.98%** | **81.8%** |
+
+Zero crashes, zero disconnects across the entire run (post stack-size fix).
+**Not formally resolved** — LLR never crossed the +2.94 bound before the run
+was stopped, so there is no "H1 accepted" event to point to. But the trend
+strengthened at every single checkpoint rather than decaying, which is the
+opposite pattern from this project's one known false-positive precedent
+(`CHECK_EXT_BUDGET=24`, which looked like +9–17 Elo at 700–1100 games and
+decayed to +3.82±12.05/LLR≈0 by 1660 games — see above). Treat +100 Elo as
+a strong, credible-but-not-fully-confirmed estimate, not a precise number.
+If more certainty is wanted later, re-run the same SPRT command and let it
+actually cross a bound before trusting a specific Elo figure.
+
+### Current deployment state
+
+`./nnue_engine` has been rebuilt from the current (multithreaded,
+stack-fixed) `nnue_engine.cpp` and is live — this is a change from every
+earlier session, where `./nnue_engine` lagged behind `nnue_engine.cpp` by
+convention (candidates were built under separate names until SPRT-confirmed).
+Given the strength and consistency of the trend above, the decision was made
+to ship Threads=4 into production now rather than wait for full SPRT
+resolution. `nnue_engine_baseline` was **not** rebuilt to include
+multithreading — it remains the pre-MT, single-threaded reference build, on
+purpose, so it stays useful as the fixed comparison point if this SPRT is
+ever resumed or re-run.
+
+The engine is also now wired up to run as a Lichess bot (`lichess-bot/`,
+gitignored — see `README.md`'s "Publishing on Lichess" section and
+`setup_lichess_bot.sh`), with `Threads: 4` in `lichess-bot/config.yml`.
+
+### What's left
+
+- **Formal SPRT resolution.** The 108-game run above was stopped early by
+  request. If the number matters precisely later (e.g. before trusting a
+  specific Elo figure in a public-facing claim), re-run
+  `nnue_engine` (Threads=4) vs. `nnue_engine_baseline` (Threads=1) at the
+  same settings and let LLR actually cross a bound.
+- **The Stockfish@2750 anchor has not been re-measured with multithreading.**
+  Everything above is internal (engine vs. itself at different thread
+  counts) — the anchor table at the top of this document is still the
+  single-thread `+61.43 Elo` result. Per the explicit decision with the
+  user, the next anchor row should be **engine @ N threads vs. SF@2750 @ 1
+  thread**, added alongside (not replacing) the existing single-thread row.
+- **Thread count beyond 4 untested via SPRT.** Only Threads=4 was
+  SPRT-tested; NPS/depth scaling was spot-checked up to Threads=8 (depth
+  reached at a fixed 1s budget: 15→17→17→18 for 1/2/4/8 threads) but that's
+  a proxy, not a game-based result. If chasing more Elo here, that's the
+  next natural test, same protocol (40-game sanity check, then a real SPRT
+  vs. the Threads=4 result, not vs. Threads=1 again).
+- **Cold helper-thread history every move** (see "Design" above) — accepted
+  as a reasonable v1 tradeoff, not measured directly. A persistent thread
+  pool would fix it at the cost of real implementation complexity; only
+  worth it if a future measurement suggests the cold-start cost is actually
+  material.
