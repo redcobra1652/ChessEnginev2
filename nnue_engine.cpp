@@ -3180,9 +3180,24 @@ int main() {
                 int myTime = (engine.board.stm == WHITE) ? wtime : btime;
                 int myInc  = (engine.board.stm == WHITE) ? winc  : binc;
                 if (myTime >= 0) {
-                    soft_limit = std::max((int64_t)50, (int64_t)(myTime / movestogo + myInc * 0.8));
-                    hard_limit = std::min((int64_t)(myTime / 2), soft_limit * 4);
-                    hard_limit = std::max(hard_limit, soft_limit);  // never below soft
+                    // safety_cap bounds both soft and hard at half the remaining
+                    // clock. Capping soft *before* deriving hard from it (rather
+                    // than capping hard and then flooring back up to soft, as the
+                    // previous version did) means hard = min(cap, soft*4) is
+                    // always >= soft automatically -- no separate max-with-soft
+                    // step needed, and critically, hard can never end up above
+                    // safety_cap the way the old max(hard_limit, soft_limit) step
+                    // let it. That mattered in practice: with myInc large relative
+                    // to a shrunk myTime (e.g. a long bullet/blitz game ground
+                    // down late), the old soft formula could exceed myTime/2, and
+                    // the old max() then silently overrode the half-clock cap,
+                    // producing a hard_limit bigger than the entire remaining
+                    // clock -- a guaranteed flag. See CLAUDE.md for the derivation
+                    // and lichess-bot log evidence.
+                    int64_t safety_cap = std::max((int64_t)10, (int64_t)myTime / 2);
+                    soft_limit = std::min(safety_cap,
+                        std::max((int64_t)50, (int64_t)(myTime / movestogo + myInc * 0.8)));
+                    hard_limit = std::min(safety_cap, soft_limit * 4);
                 }
             }
             g_node_limit = go_nodes;   // -1 if not set; search() will clear and re-apply
