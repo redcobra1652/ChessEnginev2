@@ -2400,7 +2400,7 @@ static int alpha_beta(Board &board, Accumulator &acc,
                         }
                 }
             }
-            if (static_eval - 234 * (depth - (int)improving) >= beta &&
+            if (static_eval - 100 * (depth - (int)improving) >= beta &&
                 static_eval < 900000) {
                 if (g_prune_debug) {
                     g_rfp_hits++;
