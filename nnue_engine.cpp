@@ -2250,7 +2250,7 @@ static int g_lmr[MAX_PLY][MAX_MOVES];
 static void init_lmr() {
     for (int d = 1; d < MAX_PLY; d++)
         for (int m = 1; m < MAX_MOVES; m++)
-            g_lmr[d][m] = (int)(std::log(d) * std::log(m) / 2.25 + 0.5);
+            g_lmr[d][m] = (int)(std::log(d) * std::log(m) / 1.675 + 0.5);
 }
 
 // Forward declaration

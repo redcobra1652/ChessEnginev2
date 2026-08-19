@@ -1147,13 +1147,15 @@ production change made.**
   or relaunch fresh) until LLR actually crosses a bound — per this
   document's own established discipline, a point estimate this close to
   zero this early is not a result to act on either way.
-- **The live engine is unchanged**: `nnue_engine.cpp`'s RFP coefficient is
-  still `234` at HEAD (`3212cb5`); the only committed change this session
-  was the `prunestats` instrumentation itself, which is purely additive
-  and does not alter engine behavior when `NNUE_PRUNE_DEBUG` is unset.
-  No SPRT-confirmed Elo change from this session — the Stockfish@2750
-  anchor table at the top of this document is still current and
-  unchanged.
+- **The live engine was unchanged at the end of this session**:
+  `nnue_engine.cpp`'s RFP coefficient stayed `234` at HEAD (`3212cb5`); the
+  only committed change this session was the `prunestats` instrumentation
+  itself, which is purely additive and does not alter engine behavior when
+  `NNUE_PRUNE_DEBUG` is unset. No SPRT-confirmed Elo change from this
+  session — the Stockfish@2750 anchor table at the top of this document was
+  still current and unchanged at that point.
+  **Update, later session: this changed — see "RFP margin tightening:
+  234 → 100, adopted" below. RFP is no longer 234 at HEAD.**
 
 ### Net takeaway
 
@@ -1164,6 +1166,132 @@ the depths that actually matter (2–4) is a plausible, cheap, defensible
 next test — the depth-isolated node-count signal is real — but is not yet
 an Elo win; it needs a clean, uninterrupted SPRT run to actually resolve
 one way or the other before being adopted or discarded.
+
+## Lichess time losses — root cause found and fixed (later session)
+
+The user reported the lichess bot losing a lot of games on time. Read the
+actual losses out of `lichess-bot/lichess_bot_auto_logs/lichess-bot.log`
+(grep for `outoftime`) rather than guessing: every one is a long bullet or
+blitz game (40–100+ plies) that flags near the end — the signature of a
+slow clock drain, not one catastrophic move.
+
+**Root cause, verified both mathematically and empirically.** The `go`
+handler's time formula (`nnue_engine.cpp`, in `main()`'s `go` case) was:
+
+```cpp
+soft_limit = std::max(50, myTime / movestogo + myInc * 0.8);
+hard_limit = std::min(myTime / 2, soft_limit * 4);
+hard_limit = std::max(hard_limit, soft_limit);  // never below soft
+```
+
+The last line was meant to enforce "hard is never below soft," but it also
+silently **defeats the `myTime/2` safety cap** whenever the raw formula's
+increment term pushes `soft_limit` above half the remaining clock — which
+happens whenever `myTime` drops below roughly `1.6×` the increment, entirely
+normal territory for a bullet/blitz game 40+ moves in (lichess never sends
+`movestogo`, so the engine's hardcoded default of 30 combined with a
+shrinking `myTime` walks the clock right into this regime over a long game).
+Verified empirically on the previously-deployed binary via hand-fed UCI
+commands (`NNUE_TIME_DEBUG=1`, `go wtime 500 winc 1000`): it actually
+searched for **817ms — 317ms more than the entire remaining clock**. At
+`wtime 200`, it searched **808ms, over 4x the remaining clock**. That's a
+guaranteed forfeit once a game's clock decays into this zone, and every
+`outoftime` loss in the logs matches this exact pattern.
+
+**Fix** (`nnue_engine.cpp`, commit `57ce89e`): cap `soft_limit` at
+`safety_cap = max(10, myTime/2)` *before* deriving `hard_limit` from it,
+so `hard_limit = min(safety_cap, soft_limit*4)` can never exceed the
+half-clock cap — no separate max-with-soft step needed, since a
+`soft_limit` already `<= safety_cap` makes `hard_limit >= soft_limit`
+automatic by construction. At normal (fastchess-anchor-scale) time budgets
+this is a no-op — verified the formula produces byte-identical output to
+before at `myTime=60000` — it only changes behavior in the low-time regime
+that was broken.
+
+**Companion fix, `lichess-bot/lib/engine_wrapper.py`** (gitignored, not in
+the git history — note it here since CLAUDE.md is this project's memory
+across sessions and that directory isn't tracked): `first_move_time()`
+previously returned a flat `Limit(time=10)` for the first move of every
+game regardless of time control — a guaranteed, unconditional ~17% of a
+60-second bullet clock burned on move 1 before the game even starts. Now
+scales with the actual base clock (`min(10s, max(500ms, base_time * 0.05))`).
+
+**Verification approach, deliberately not SPRT.** This is a correctness
+fix, not an Elo experiment — the fastchess anchor (`tc=8+0.08`, zero time
+losses across 8126+ sampled moves in the original time-management SPRT)
+never runs long or low enough to trigger this bug, so an SPRT of this fix
+would be blind to the thing it fixes and would likely read as a small,
+meaningless regression (an engine that stops overspending searches
+marginally less). Verified instead via hand-fed `NNUE_TIME_DEBUG=1` UCI
+commands at bullet-shaped inputs (`wtime 500/200/1/60000`, `winc 1000`),
+confirming the fix caps correctly at low `myTime` and is unchanged at
+normal `myTime`. Both `./nnue_engine` and `nnue_engine_baseline` were
+rebuilt with this fix (no lichess-bot process was running at the time,
+confirmed via `ps aux` before overwriting the live binary).
+
+## RFP margin tightening: 234 → 100, adopted (later session)
+
+Follow-up to "Session follow-up: is search depth the ceiling..." above,
+same session as the time-management fix. The user asked directly to keep
+cutting/tightening for more depth, having already been told the framing
+"94% of nodes at depth ≤3 is a bug" was wrong — that's normal alpha-beta
+tree shape (exponential node-mass falloff toward the leaves in any engine,
+Stockfish included), not something to fix. The real, already-identified
+lever from the prior session's node-mass measurement stands: node mass
+concentrates at remaining depth ≤4, so tightening RFP there (not extending
+pruning's reach to higher nominal depths, where there's nothing left to
+prune) is where the leverage is.
+
+Measured the marginal firing-rate gain of a further 165→100 step (500
+sampled real-game positions, depth 2–4 band, same methodology as the
+234→165 measurement above): **+11.2 percentage points** — larger than the
+234→165 step's +8.77pp, i.e. not a diminishing-returns case.
+
+Built `nnue_engine_rfp100_candidate` (one-line change, `234`→`100`, RFP
+gating line only — the separate, already-existing `RFP_MARGIN` constant at
+the top of the file is unrelated dead code, see caution below). 40-game
+sanity check passed clean (14W–10L–16D, 55%, no forfeits/crashes). Full
+SPRT (`elo0=0 elo1=10`, `tc=8+0.08`, `concurrency=4`, `-recover` — the
+`165` attempt died to an unrelated disconnect at game 308 without that
+flag) launched against the baseline.
+
+**Stopped by explicit user request at 260 games, not run to LLR
+resolution.** Progression across checkpoints:
+
+| Games | Elo | LOS | LLR (of the way to +10 bound) |
+|---|---|---|---|
+| 138 | +45.58 ± 38.16 | 99.13% | 24.9% |
+| 180 | +48.57 ± 34.20 | 99.77% | 33.2% |
+| 220 | +41.25 ± 30.82 | 99.60% | 34.3% |
+| 260 | +38.91 ± 27.94 | 99.71% | 38.9% |
+
+Unlike the `CHECK_EXT_BUDGET=24` false positive (which looked like +9–17
+Elo at 700–1100 games and decayed to +3.82±12.05/LLR≈0 by 1660 games), this
+result held stable in the high-30s to high-40s across the entire
+138→260-game range rather than decaying. The user made an informed call,
+aware of that precedent, to adopt on this basis rather than wait for full
+resolution. **Adopted, not formally resolved** — flagging the provenance
+honestly rather than presenting +38.91 as a confirmed number. If this ever
+needs re-verifying, rebuild a baseline from before commit `3c8418f` and
+resume the same SPRT command.
+
+Deployed: `nnue_engine.cpp`'s RFP gate is now `static_eval - 100 * (depth -
+improving) >= beta` (was `234`), committed as `3c8418f`. Both
+`./nnue_engine` and `nnue_engine_baseline` rebuilt from it.
+
+**Caution for next session: `RFP_MARGIN = 120` (top of file, marked
+`[[maybe_unused]]`) is dead code, unrelated to the actual RFP gate.** It's
+been present and unused since the initial commit — the real gate has always
+used a hardcoded literal (`234`, now `100`), never this constant. Don't
+assume it reflects the live margin; it doesn't and never has. Worth wiring
+up or deleting at some point, not done yet.
+
+**Stockfish@2750 anchor table at the top of this document is now stale** —
+it predates both the time-management fix and this RFP change, and was
+never a fixed-margin comparison to begin with (it was measured with RFP at
+234, the pre-time-fix formula, both since changed). Re-running that anchor
+is still open, same as it's been since the multithreading section above —
+not done this session either.
 
 ## Multithreading (Lazy SMP) — implemented, one real bug found and fixed, internal SPRT strongly positive but not formally resolved
 
@@ -1281,9 +1409,21 @@ convention (candidates were built under separate names until SPRT-confirmed).
 Given the strength and consistency of the trend above, the decision was made
 to ship Threads=4 into production now rather than wait for full SPRT
 resolution. `nnue_engine_baseline` was **not** rebuilt to include
-multithreading — it remains the pre-MT, single-threaded reference build, on
-purpose, so it stays useful as the fixed comparison point if this SPRT is
-ever resumed or re-run.
+multithreading at the time — it was kept as the pre-MT, single-threaded
+reference build on purpose, so it stayed useful as the fixed comparison
+point if this SPRT was ever resumed or re-run.
+
+**Update, later session: this invariant no longer holds.** A follow-up
+session's time-management fix and RFP=100 change (see "Lichess time losses"
+and "RFP margin tightening" below) were both deployed to `nnue_engine_baseline`
+as well as `./nnue_engine`, since the project's own standing rule ("rebuild
+`nnue_engine_baseline` fresh after every commit that changes `nnue_engine.cpp`")
+takes precedence for correctness-and-latest-adopted-change tracking.
+`nnue_engine_baseline` is **no longer the pre-MT single-threaded reference** —
+it is multithreaded, time-fix-included, RFP=100. If the Lazy SMP SPRT above is
+ever resumed to seek formal resolution, rebuild a fresh pre-MT single-threaded
+reference from commit `2781dc7`'s parent instead of using `nnue_engine_baseline`
+as it currently stands.
 
 The engine is also now wired up to run as a Lichess bot (`lichess-bot/`,
 gitignored — see `README.md`'s "Publishing on Lichess" section and
@@ -1313,3 +1453,105 @@ gitignored — see `README.md`'s "Publishing on Lichess" section and
   pool would fix it at the cost of real implementation complexity; only
   worth it if a future measurement suggests the cold-start cost is actually
   material.
+
+## LMR reduction curve steepened: divisor 2.25 → 1.675, adopted
+
+Triggered by the user asking directly: raw NPS is on par with Stockfish
+(see the earlier NPS diagnostic section), so why does this engine reach
+nowhere near Stockfish's nominal search depths (16-18) in a comparable
+time budget? Answered with a direct measurement, not a repeat of the
+earlier (correctly cautious, but ultimately hand-wavy) "cross-engine depth
+units aren't comparable" conclusion.
+
+**Measurement.** Same hardware, both Threads=1, Hash=64, startpos, `go
+depth 18`:
+
+| | nodes | time | NPS |
+|---|---|---|---|
+| Stockfish 18 | 177,777 | 120ms | ~1.48M |
+| nnue_engine (pre-change) | 4,446,239 | 2,684ms | ~1.66M |
+
+NPS is tied, but Stockfish needed **~25x fewer nodes** to complete the
+same nominal depth, and the ratio climbs steadily with depth (~2x at
+depth 2, ~9x at depth 13, ~25x at depth 17-18) rather than bouncing
+around — a real, growing search-efficiency gap, not the noisy
+non-monotonic signal the older "Cross-engine nominal-depth comparison is
+invalid" section was right to distrust (that measurement used a
+pre-time-fix binary and a much cruder methodology; treat this section as
+superseding it for the specific claim "NPS parity ⇒ depth parity," while
+that section's general caution about cross-engine depth units still
+holds — this comparison only trusts the *ratio's growth trend*, not an
+exact "Stockfish's depth 18 == our depth 18" claim).
+
+**Suspected cause, read directly from the code:** `init_lmr()`
+(`nnue_engine.cpp:2250-2254`) computes the LMR reduction table as
+`log(d)*log(m) / 2.25 + 0.5`, and the reduction is only applied to quiet,
+non-check, non-promotion moves (`nnue_engine.cpp:2679-2680`) — both
+plausible, low-risk levers for a search that fans out faster than
+Stockfish's per additional ply.
+
+**Experiment, per explicit user instruction: sanity-check only, no SPRT.**
+Tested four candidate divisors (all steeper than 2.25, i.e. larger
+reductions), each as a standalone 40-game check (`tc=8+0.08`,
+`-concurrency 4`, `-openings openings.epd order=random`) against the same
+unmodified `nnue_engine_baseline` (divisor 2.25). Zero crashes, forfeits,
+disconnects, or time losses across all four runs (grepped for
+`disconnect|timeout|crash|terminated|illegal` in each log — none found).
+
+| divisor | Score | Elo | LOS |
+|---|---|---|---|
+| 1.6 | 48.75% (8W-9L-23D) | -8.69 ± 71.11 | 40.40% |
+| 1.7 | 52.50% (9W-7L-24D) | +17.39 ± 73.07 | 68.23% |
+| **1.675 (adopted)** | **55.00% (12W-8L-20D)** | **+34.86 ± 72.38** | **83.26%** |
+| 1.75 | 53.75% (12W-9L-19D) | +26.11 ± 86.61 | 72.76% |
+
+**All four results are statistically indistinguishable from each other**
+(±70-90 Elo error bars, heavily overlapping) — this is explicitly *not* a
+resolved tuning result. Flagging this honestly rather than presenting
+1.675 as confirmed-best: it has the highest point estimate and LOS of the
+four, and the user made an informed call to adopt on that basis, aware
+the sample size can't truly separate these four values. Same "adopted,
+not formally resolved" provenance as the RFP=100 change above — if this
+ever needs re-verifying, rebuild a divisor=2.25 baseline and run a real
+SPRT (`elo0=0 elo1=10`) against it.
+
+**Node-count effect, measured directly (single `go depth` calls, not
+part of the game testing above):**
+
+| position | depth | baseline (2.25) | 1.6 | 1.675 | 1.75 |
+|---|---|---|---|---|---|
+| startpos | 18 | 4,446,239 | 2,740,986 (-38.4%) | 4,083,192 (-8.2%) | 2,522,452 (-43.3%) |
+| Kiwipete-like tactical mg | 14 | 401,562 | 362,842 (-9.6%) | 327,442 (-18.4%) | 310,639 (-22.6%) |
+
+**Important finding, worth remembering before trying to tune this further:
+node counts on a single fixed position are not a reliable proxy for
+reduction aggressiveness once you're comparing nearby divisor values.**
+The Kiwipete row is clean and monotonic (steeper divisor → fewer nodes,
+as expected). The startpos row is not — 1.675 barely reduced nodes
+despite being a steeper cut than 1.75. This isn't measurement error; it's
+alpha-beta's well-known chaotic sensitivity to small parameter changes —
+a slightly different reduction shifts which move gets explored first at
+some shallow node, which shifts a cutoff, which cascades into a
+meaningfully different tree by depth 18. Don't grid-search this parameter
+by single-position node counts again; only a real game-based measurement
+(and a large enough sample) means anything near an already-reasonable
+value.
+
+**Deployed:** `nnue_engine.cpp`'s `init_lmr()` divisor is now `1.675`
+(was `2.25`), and both `./nnue_engine` and `nnue_engine_baseline` were
+rebuilt fresh from this change (no `lichess-bot` process was running at
+the time, confirmed via `ps aux` before overwriting the live binary) —
+so `nnue_engine_baseline` no longer represents the pre-this-change state;
+rebuild from before this change if a clean A/B reference is needed again.
+**Uncommitted as of the end of this session** — the working tree has this
+edit but no commit was made (only commit when explicitly asked, per
+standing practice).
+
+**If more Elo is wanted from this specific parameter later:** don't
+repeat the one-value-at-a-time 40-game grid search — it's shown here to
+be noise-limited (all four candidates landed within a ~6-point score
+band of each other and of 50%, indistinguishable at this sample size).
+Either commit to a real SPRT at a single suspected-best value, or invest
+in SPSA-style local tuning across several parameters at once (the
+approach mature engines like Stockfish actually use for this class of
+constant), rather than more fixed-point sanity checks.
