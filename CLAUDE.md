@@ -1978,3 +1978,148 @@ effect is sound even without a tight Elo number.
 `book_sanity_check.py` (restored after an accidental deletion mid-session
 — rewritten to note the now-superseded status of the Python-layer path
 it validates).
+
+## Bullet time-drain diagnosis: two real causes found, both fixed (partial fix, not full resolution)
+
+The user reported the lichess bot spending the majority of a bullet clock
+(50 of 60s) in just the first 20 moves and asked why. Diagnosed with two
+distinct, real, independently-verified causes — not a single root cause —
+both in the time-management/book path, not the search itself.
+
+### Cause 1: best-move-instability stretch fires on almost every move, not just genuinely volatile ones
+
+`iterate()`'s instability heuristic (`nnue_engine.cpp`, in the iterative
+deepening loop) multiplies the move's effective soft time budget by 1.3x
+every time the best move changes between two consecutive completed
+iterations at depth ≥5, capped at `hard_limit = min(myTime/4,
+soft_limit*2.5)`. The trigger was a bare best-move label change — no check
+on whether the position's evaluation actually moved. Verified directly via
+a real bullet self-play game (`NNUE_TIME_DEBUG=1`, 60+0, actual measured
+think time decrementing the clock each move): once past the book, nearly
+every move landed at 1.4x-2.5x its nominal `myTime/movestogo` share, with
+several hitting the hard cap outright — by move 20, roughly 34-40s of a
+60s clock was already gone.
+
+Instrumented every instability-candidate event (added a temporary
+`NNUE_INSTAB_DEBUG=1` env-gated print, since removed) across 205 events
+sampled from 12 diverse `openings.epd` positions: median score delta at
+trigger time was just **6cp**, and **83% of events were under 20cp** —
+i.e. the overwhelming majority of "instability" was cosmetic reordering
+among near-equal quiet moves (search noise), not a real re-evaluation of
+the position. Genuine large swings (up to 118cp in this sample) were rare
+(~5% of events above 40cp).
+
+**Fix**: added `INSTABILITY_SCORE_DELTA = 20` (cp) and require the score
+to have moved by at least that much, in addition to the best-move label
+changing, before applying the 1.3x stretch (`nnue_engine.cpp`, `iterate()`
+and the new constant near `CHECK_EXT_BUDGET`). This keeps the safety net
+for genuinely volatile positions while filtering out the noise-driven
+triggers that were dominating in practice.
+
+### Cause 2: lichess-bot's first move bypassed the book entirely and burned a full fixed-time search
+
+`lichess-bot/lib/engine_wrapper.py`'s `first_move_time()` (gitignored, not
+in git history, noted here per this project's standing convention) sends
+`go movetime X` — not `wtime`/`btime` — for **both** sides' very first
+move of every game (`len(board.move_stack) < 2`), where `X = min(10s,
+max(0.5s, base_time*0.05))` (3000ms for a 60s bullet base). The engine's
+`OwnBook` consult gate (`nnue_engine.cpp`, the `go` handler) required
+`wtime`/`btime` to be present, on the documented assumption that
+lichess-bot always sends those for real play and only sends `movetime`
+for fixed-time analysis queries. **That assumption was wrong** — verified
+by reading `engine_wrapper.py` directly, not inferred. The practical
+effect: every real game's first move for both colors silently skipped the
+book (even though the position was book-covered) and ran a full,
+non-time-managed fixed search instead (`soft_limit = -1` for movetime-based
+searches, no early exit) — a straight, unconditional **3s burned on a
+60s bullet clock (5% of the entire game) on a move the book already
+answered for free**, on move 1, before the game had meaningfully started.
+
+**Fix**: broadened the book-consult gate to fire on any real-time-bounded
+`go` (movetime **or** wtime/btime present), excluding only unbounded
+analysis (`go infinite`/`go depth`/`go nodes`). Verified directly: `go
+movetime 3000` from `startpos` with `OwnBook=true` now returns the book
+move in 0ms, matching exactly what lichess-bot sends for a 60s-bullet
+first move.
+
+### Measured effect: real but partial — read the numbers carefully, don't over-claim
+
+Built a probe (`prod_probe.py`, not checked in) that reproduces the actual
+lichess-bot flow exactly: first ply of each side via `go movetime`
+(matching `first_move_time()`'s formula), every subsequent move via `go
+wtime/btime`, `Threads=4` (matching `config.yml`), `OwnBook=true`. Ran 2
+self-play games each, pre-fix vs. both-fixes-applied, from `startpos`:
+
+| | avg time spent by White's move 20 | avg time spent by Black's move 20 |
+|---|---|---|
+| pre-fix | 38,691 ms | 39,798 ms |
+| both fixes | 35,872 ms | 34,992 ms |
+| reduction | -7.3% (-2,819ms) | -12.1% (-4,806ms) |
+
+**This is a real, directionally-confirmed improvement, but a partial one,
+not a full resolution — say so honestly if this comes up again.** n=2 runs
+per side is small and self-play at `Threads=4` has some run-to-run
+variance (Lazy SMP's unlocked TT reads aren't fully deterministic). The
+event-count reduction from the score-delta gate (83% of trigger events
+removed) does **not** translate to an 83% wall-clock reduction, because
+stretch events compound multiplicatively (1.3x per surviving event) and
+clip at the 2.5x hard cap — a move that previously had several
+noise-level events, all now filtered, drops from a capped ~2.5x multiplier
+to something much closer to 1.0-1.3x, which is a large per-move win: but a
+move that already had exactly one genuine large-delta event is completely
+unaffected by design, since the fix is specifically built to preserve that
+case. The two effects (book fix + instability-gate fix) are bundled in
+the table above, not isolated from each other.
+
+**A structural cause was identified but deliberately left untouched**:
+`movestogo` is hardcoded to `30` in the `go` handler regardless of actual
+game length or ply count (lichess never sends it). For a bullet game that
+runs materially longer or shorter than 30 total moves per side, this
+alone front- or back-loads time allocation independent of anything fixed
+this pass. Not touched this session — flagged as the next concrete lever
+if more of this gap needs closing, but it changes the *pacing* formula
+itself (not just how far a single move can overshoot it, which is what
+both fixes above touched), so it needs its own dedicated
+measurement-then-fix pass, not a bundled guess.
+
+### Verification methodology note: the project's standard `tc=8+0.08` SPRT harness cannot see this class of fix
+
+Same structural blind spot already documented for the original
+"Lichess time losses" fix above: at `tc=8+0.08` (~8s base), the clock
+never gets low enough during a game for either of these bugs to matter —
+a fixed 3s first-move burn or a 2.5x-capped stretch are comparatively
+tiny against an 8s budget that resets every move via increment. A 40-game
+sanity check (`sanity_timefix2.log`, both-fixes candidate vs. a pre-fix
+baseline, `tc=8+0.08`, `-concurrency 4`, `-recover`) completed cleanly —
+40/40 games, zero crashes/disconnects/forfeits, 11W-6L-23D, Elo +43.66 ±
+64.91, LOS 91.12% — but per this project's own established protocol this
+is a **did-I-break-anything gate only, not an Elo verdict**: the error
+bars comfortably include zero, and the harness that produced this result
+structurally cannot exercise the actual bug being fixed. Don't cite
++43.66 as a confirmed Elo gain if this comes up again. If a real Elo
+number is ever wanted for this specific class of fix, it would need a
+longer/lower base time control (or a real low-time endgame test) to
+actually stress the clock the way a real bullet game does — not
+attempted this session.
+
+**Operational note, logged for the next session**: while the sanity-check
+`fastchess` run above was in flight, the candidate binary it referenced
+(`nnue_engine_instabilityfix_candidate`) was rebuilt in place to add the
+second (book/movetime) fix — a direct violation of this project's own
+"never rebuild a binary an active run references" rule, made worse by
+that run using `-recover` (which can respawn engine processes mid-run and
+pick up the rebuilt file). Caught before trusting the result: the run was
+killed, the combined-fix binary was renamed to a fresh path
+(`nnue_engine_timefix2_candidate`), and the sanity check was re-run
+cleanly from scratch against that fixed name. The result quoted above is
+from that clean re-run, not the contaminated one.
+
+### Deployment
+
+Both fixes are committed to `nnue_engine.cpp`. `./nnue_engine` and
+`nnue_engine_baseline` were both rebuilt from this state (no
+`lichess-bot` process was running at the time, confirmed via `ps aux`
+before overwriting) — so both now include: the score-delta-gated
+instability stretch, the broadened book/movetime gate, and everything
+previously documented above (Lazy SMP, RFP=100, LMR divisor 1.675, native
+UCI Polyglot book, the original time-management overrun/low-clock fixes).

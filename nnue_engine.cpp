@@ -123,6 +123,11 @@ static constexpr int DELTA_MARGIN   = 200;
 // unbounded (every checking move got +1 unconditionally) — see the
 // check-extension gate in the move loop for why this exists.
 static constexpr int CHECK_EXT_BUDGET = 16;
+static constexpr int INSTABILITY_SCORE_DELTA = 20;  // cp; see iterate()'s
+    // best-move-instability stretch -- a bare best-move label change is too
+    // noisy a trigger on its own (fires on almost every real move once past
+    // the book, see CLAUDE.md's bullet time-drain diagnosis), so also
+    // require the score to have moved by at least this much.
 [[maybe_unused]] static constexpr int RFP_MARGIN     = 120;
 
 static constexpr int FUTILITY_MARGIN[5] = {0, 100, 200, 300, 400};
@@ -2937,10 +2942,15 @@ struct Engine {
 
             if (iter_pv_len > 0) {
                 // Instability: the best move changed from the previous
-                // completed iteration. Ignore the shallow depths, where this
-                // is just noise rather than a signal worth reacting to.
+                // completed iteration AND the score actually moved by a
+                // real margin, not just a label swap among near-equal
+                // moves (the latter fires on almost every move in quiet
+                // middlegame positions and was draining bullet clocks --
+                // see CLAUDE.md). Ignore the shallow depths, where this is
+                // just noise rather than a signal worth reacting to.
                 if (soft_limit_ms >= 0 && d >= 5 &&
-                    best_move != NO_MOVE && iter_pv[0] != best_move) {
+                    best_move != NO_MOVE && iter_pv[0] != best_move &&
+                    std::abs(score - best_score) >= INSTABILITY_SCORE_DELTA) {
                     effective_soft = std::min(g_time_limit_ms,
                                                (int64_t)(effective_soft * 1.3));
                 }
@@ -3566,11 +3576,19 @@ int main() {
                     hard_limit = std::min(safety_cap, (int64_t)(soft_limit * 2.5));
                 }
             }
-            // Book consult: same gating condition as the timed-game branch
-            // above (real games only -- wtime/btime present, not a fixed
-            // `go depth`/`go movetime`/analysis query), matching how
-            // lichess-bot's own book only fires during real play.
-            if (g_own_book && !infinite && movetime < 0 && go_nodes < 0 && (wtime >= 0 || btime >= 0)) {
+            // Book consult: fires for any real-time-bounded move (wtime/btime
+            // OR a fixed movetime), excluding only `go depth`/`go nodes`/
+            // `go infinite` (unbounded analysis queries). Originally gated on
+            // wtime/btime only, on the assumption lichess-bot always sends
+            // those for real play -- that assumption was wrong:
+            // lib/engine_wrapper.py's first_move_time() sends `go movetime`
+            // (not wtime/btime) for BOTH sides' very first move of every
+            // game, so the book was silently skipped, and a full fixed-
+            // movetime search (soft_limit=-1, no early exit) ran instead --
+            // e.g. 3s of an otherwise-book-covered move on a 60s bullet
+            // clock, 5% of the whole game gone before move 1 finished.
+            if (g_own_book && !infinite && go_nodes < 0 &&
+                (movetime >= 0 || wtime >= 0 || btime >= 0)) {
                 Move book_mv = probe_book(engine.board);
                 if (book_mv != NO_MOVE) {
                     std::cout << "bestmove " << engine.board.move_uci(book_mv) << "\n" << std::flush;
