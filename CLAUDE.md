@@ -1543,9 +1543,7 @@ rebuilt fresh from this change (no `lichess-bot` process was running at
 the time, confirmed via `ps aux` before overwriting the live binary) —
 so `nnue_engine_baseline` no longer represents the pre-this-change state;
 rebuild from before this change if a clean A/B reference is needed again.
-**Uncommitted as of the end of this session** — the working tree has this
-edit but no commit was made (only commit when explicitly asked, per
-standing practice).
+Committed as `0ae1099`.
 
 **If more Elo is wanted from this specific parameter later:** don't
 repeat the one-value-at-a-time 40-game grid search — it's shown here to
@@ -1555,3 +1553,428 @@ Either commit to a real SPRT at a single suspected-best value, or invest
 in SPSA-style local tuning across several parameters at once (the
 approach mature engines like Stockfish actually use for this class of
 constant), rather than more fixed-point sanity checks.
+
+## Next steps for a future session: closing the search-efficiency gap further
+
+The LMR change above is a first cut at the node-efficiency gap, not a
+resolution of it — even at the adopted 1.675 divisor, this engine still
+needs meaningfully more nodes than Stockfish to reach the same nominal
+depth (the startpos measurement showed only an 8.2% node reduction at
+1.675, well short of what 1.75's 43.3% showed, and neither has been
+confirmed as a real Elo gain via SPRT). Concrete, not-yet-tried next
+steps, roughly in order of expected leverage:
+
+1. **Formally resolve whether 1.675 (or any tested divisor) is actually
+   an improvement.** The 40-game checks were deliberately noise-limited
+   sanity checks, not SPRTs. Before trusting any Elo claim about this
+   change, run `nnue_engine` (divisor 1.675) vs. a freshly-built
+   divisor=2.25 reference at `elo0=0 elo1=10` and let LLR actually cross
+   a bound. `nnue_engine_baseline` no longer holds the 2.25 state (it was
+   rebuilt to 1.675 alongside `./nnue_engine`) — rebuild the 2.25
+   reference from `git show 3c8418f:nnue_engine.cpp` (the commit
+   immediately before this session's change) if this is picked up.
+2. **Extend LMR to captures.** Currently `nnue_engine.cpp:2679-2680`
+   excludes every capture from reduction entirely — modern Stockfish
+   reduces captures too (smaller magnitude, gated on capture history/SEE
+   rather than being a flat exclusion). This is a plausible reason the
+   Kiwipete (capture-heavy) node reduction was consistently smaller than
+   startpos's across every divisor tested this session. Untested; would
+   need its own gating logic (probably capture-history-based, mirroring
+   the existing quiet-move stat-score adjustment at
+   `nnue_engine.cpp:2686-2689`), its own sanity check, and its own SPRT —
+   don't just flip the exclusion off without a magnitude scheme, that's
+   likely to be a large regression.
+3. **Re-run the Stockfish node-count comparison at scale, not on 2
+   positions.** This session's "25x more nodes to reach depth 18" and the
+   per-divisor node tables were both single-position spot checks — cheap
+   but noisy (see the non-monotonic startpos finding above). The project
+   already has the right instrumentation pattern for a real answer: the
+   `prunestats` methodology from the "Node-mass-by-depth measurement"
+   section (3,903 real-game positions, deduped FENs from
+   `games/vs_sf2750.pgn`) measured pruning firing rates at scale — the
+   same sampling approach, adapted to record nodes-to-fixed-depth instead
+   of pruning hits, would give a trustworthy answer to "how much of the
+   Stockfish gap is actually closed" instead of the 2-position estimate
+   this session used.
+4. **Consider whether other Stockfish-ported constants are similarly
+   undertuned for this net**, the same way LMR's divisor and RFP's
+   margin turned out to be. Candidates not yet touched this project:
+   the NMP reduction formula (`R = (1062 + 68*depth)/256 + ...`,
+   `nnue_engine.cpp:2417`), the cut-node/PV LMR adjustments (`r += 2` /
+   `r -= 1`, `nnue_engine.cpp:2691-2693`), and ProbCut's margin. Same
+   protocol each time: one bounded hypothesis, cheap sanity check,
+   real SPRT before adopting — not a simultaneous multi-parameter sweep,
+   which this session's noise-limited 40-game results suggest this
+   project's current game-testing budget can't reliably rank anyway.
+5. **If tuning several of the above together ever becomes worth it**,
+   revisit the SPSA note above rather than more one-at-a-time grid
+   searches — this session's four-divisor sweep used ~160 games total
+   and still couldn't separate the candidates; a multi-parameter
+   one-at-a-time sweep would cost proportionally more for the same
+   noise floor.
+
+## SEE-aware move-ordering candidate (item 2 above, attempted): inconclusive, not adopted
+
+Later session, direct attempt at item 2 from the list above ("extend LMR to
+captures"). Built `nnue_engine_seelmr_candidate`: SEE-aware capture scoring
+in `score_moves` (good captures scored `1'000'000 + vv*6 + cap_hist`, bad/
+losing-SEE captures demoted to `-1'000'000 + cap_hist`, instead of being
+lumped in with quiets at a flat score) plus LMR eligibility extended to bad
+(SEE<0) captures specifically, at a lighter `r = r * 2/3` reduction than
+quiets get. Good (SEE≥0) captures are still excluded from LMR entirely —
+this candidate only reduces the *bad* half of item 2, not the full change
+modern Stockfish makes.
+
+**Sanity check: clean on the third attempt, result inconclusive.** The
+first two 40-game sanity-check attempts were contaminated by macOS system
+sleep suspending the long-running background `fastchess` process mid-run
+(spurious 15–30+ minute "overrun" timeouts unrelated to engine timing —
+root-caused via `pmset -g log`/`pmset -g assertions`). Fixed by wrapping
+the run in `caffeinate -i -w <pid> --`. Third attempt completed clean: 40/40
+games finished, zero timeouts/disconnects/crashes/overruns (grepped the
+log for all of those, no matches).
+
+```
+Results of seelmr vs baseline (8+0.08, 1t, 64MB, openings.epd):
+Elo: 8.69 +/- 66.67, nElo: 14.21 +/- 107.67
+LOS: 60.20 %, DrawRatio: 55.00 %, PairsRatio: 0.80
+Games: 40, Wins: 10, Losses: 9, Draws: 21, Points: 20.5 (51.25 %)
+```
+
+No red flags (not a lopsided ~90% loss the way a genuinely broken change
+looks), but also nowhere near a signal — ±66.67 Elo error bars around a
++8.69 point estimate is indistinguishable from zero at this sample size.
+Per this project's own protocol a clean-but-flat sanity check like this is
+normally a green light to proceed to a real SPRT, not a verdict either way
+— but the node-count measurement below gave a concrete reason to doubt
+this candidate before spending SPRT-scale compute on it.
+
+**Node-count measurement (single-threaded, Hash=64, same methodology as
+the LMR-divisor table above) explains why the game result was flat, not
+positive: the effect is double-edged, not a clean win.**
+
+| Position | Depth | Stockfish nodes | live `nnue_engine` nodes (ratio to SF) | seelmr candidate nodes (ratio to SF) |
+|---|---|---|---|---|
+| startpos (quiet opening) | 18 | 177,777 | 4,083,192 (23.0x) | 2,783,431 (**15.7x — better**) |
+| Kiwipete (tactical, capture-heavy) | 16 | 122,426 | 596,043 (4.9x) | 797,131 (**6.5x — worse**) |
+
+On the quiet position the candidate closes nearly half the node-count gap
+to Stockfish. On the capture-heavy position it makes the gap *worse* than
+the unmodified engine, not just less-improved. This is a plausible direct
+consequence of the design: only bad captures get any reduction, and good
+captures are still fully excluded from LMR (same as before) — on a
+position dominated by captures, the SEE-based reordering can change which
+captures get tried first without cutting the actual branching factor much,
+while the extra scoring/SEE-check overhead and altered move order can
+shift which lines get explored deeper. **Same "single-position node counts
+are chaotically noisy near an already-reasonable value" caution the LMR-
+divisor section already documented applies here too** — two positions is
+not a scaled measurement — but the sign flip between a quiet and a sharp
+position (not just a magnitude difference) is a more structural concern
+than ordinary noise, and lines up with the game result landing flat
+instead of positive.
+
+**Verdict (user call, after reviewing both the sanity check and the
+node-count table): a fail, inconclusive — not adopted.** Move ordering
+alone (at least this specific, partial implementation of it) is not
+confirmed to close the EBF/node-efficiency gap to Stockfish. No full SPRT
+was run — the node-count sign-flip was reason enough not to spend that
+compute on this specific candidate. `nnue_engine_seelmr_candidate` is left
+in the repo as a reference/starting point, not merged into
+`nnue_engine.cpp`; `./nnue_engine` and `nnue_engine_baseline` are
+unchanged (still LMR divisor 1.675, RFP 100, per the state documented
+above).
+
+**Next-step guidance, per explicit user direction: stop iterating on move
+ordering as the lever for the EBF gap; look at more/different pruning, or
+consider that an actual bug (not just an undertuned parameter) may be
+contributing to the ~5–23x node-count gap.** This reframes item 2 above
+from "extend LMR to captures" (attempted, inconclusive) toward two
+untried directions:
+
+- **More/different pruning**, not just re-tuning existing margins (RFP/NMP/
+  ProbCut margins are already documented as tuned or ruled out above) —
+  e.g. history-based pruning gates not yet present, or futility/LMP
+  extended further than currently scoped, evaluated the same way (bounded
+  hypothesis, sanity check, real SPRT).
+- **A genuine bug**, not a tuning gap, as a live hypothesis for the node-
+  count blowup. Nothing specific has been found yet — this is flagged as
+  worth auditing, not a confirmed finding. Candidate places to look, given
+  what's already been ruled out elsewhere in this document (TT, IIR,
+  history gravity, bucket formula, LMR sophistication are all previously
+  confirmed clean — don't re-audit those): the move-loop's interaction
+  between pruning/reduction gates and re-search triggers (an overly broad
+  full-depth re-search condition would silently re-inflate the tree after
+  a reduction, the same *class* of bug as the ungated-re-search timing bug
+  found earlier this project, just for node count instead of clock time),
+  and whether TT cutoffs are actually firing at the rate expected for a
+  ~5-23x-worse-than-Stockfish tree (an unexpectedly low TT hit rate at
+  shallow depth would point at move-ordering/replacement-scheme issues
+  rather than pruning aggressiveness). Not yet investigated — next session
+  should instrument and measure before guessing further.
+
+## Futility/LMP tightening: node-count reduction confirmed real, but game-tested negative twice — reverted, not adopted
+
+Direct follow-up to the node-count-gap investigation above, later session.
+User's framing: node counts, not Elo, are the metric to chase first — build
+node-count evidence at scale before spending any game-testing budget, and
+don't run games without an explicit go-ahead (the session opened with a
+sharp correction after an earlier candidate's sanity check was launched as
+three separate foreground `fastchess` calls that each hit Bash's 2-minute
+timeout — the fix, followed for the rest of the session, was `nohup ... &`
+plus the `Monitor` tool's `until ! kill -0 <pid>` pattern for anything
+long-running).
+
+**RFP was left alone this pass** (explicit user instruction — "RFP seems
+tight enough right now"), consistent with its own already-thin headroom
+documented in the RFP=100 section above. Attention went to futility pruning
+and Late Move Pruning (LMP) instead, per direct user request. A first
+attempt at a different lever — negative/reduced singular extensions
+(mirroring Stockfish's extension-budget mechanics) — was tried and
+abandoned early: only a 4% median node reduction on a node-count sweep,
+called out directly by the user as insufficient, and fully reverted from
+the source before this section's work began.
+
+### Method
+
+New `nodecount_sweep.py` (checked into the repo root, reusable) compares
+two engine binaries' node counts at a fixed `go depth N` across sampled
+real-game FENs (same PGN/dedup/ply-window convention as the project's
+existing `prunestats` sampling) and reports median/mean/IQR of the ratio —
+a fast, game-free way to screen a search-tuning candidate before spending
+any `fastchess` budget, consistent with this project's established
+protocol.
+
+Extended the existing `prunestats` instrumentation (env-gated, additive,
+zero cost when off) with a candidate-scale simulation for futility and LMP,
+mirroring the pattern already used for RFP's margin coefficient: alongside
+the real (currently active) pruning decision, the same node also computes
+what several *candidate* tighter scale factors *would* have decided,
+without changing actual search behavior. This let the headroom of both
+mechanisms be measured at scale (300 real-game positions) before building
+any real candidate binary.
+
+**Finding: futility pruning has substantially more unsaturated headroom
+than LMP.** Simulated scale factors 1.0 down to 0.25 relative to a given
+baseline: futility's skip count kept climbing all the way to 0.25 with no
+sign of flattening (+51% skips at 0.25 vs. the reference), while LMP's
+skip count visibly flattened past roughly 0.55-0.7 (+21% at 0.55, only
++21% more by 0.25 — diminishing returns setting in much earlier than for
+futility). This shaped the scale choices below: LMP was tightened less
+aggressively than futility whenever the two were varied together.
+
+### Node-count sweep results
+
+Built real candidate binaries (`FUTILITY_MARGIN` and `LMP_MOVES` both
+scaled by a single factor from their original values — `{0,100,200,300,400}`
+and the original depth-indexed LMP table respectively) at six scales,
+200-250 sampled positions each, depth 12, vs. the (untouched, RFP=100)
+baseline:
+
+| scale | median ratio | mean | IQR | improved / worse |
+|---|---|---|---|---|
+| 0.55 | 0.822 | 0.903 | [0.581, 1.064] | 70.5% / 29.5% |
+| 0.60 | 0.819 | 0.914 | [0.623, 1.100] | 69.0% / 30.5% |
+| 0.65 | 0.824 | 0.902 | [0.617, 1.050] | 70.0% / 30.0% |
+| 0.70 | 0.821 | 0.941 | [0.648, 1.165] | 64.0% / 35.5% |
+| 0.75 | 0.840 | 0.957 | [0.644, 1.172] | 64.0% / 36.0% |
+| 0.80 | 0.898 | 1.005 | [0.680, 1.228] | 57.0% / 42.5% |
+
+0.55-0.65 were statistically indistinguishable from each other on median
+(~18% node reduction, n=200 — below this project's own established noise
+floor for chasing sub-percent node-count differences) but clearly better
+than 0.70 on both mean and IQR tail — 0.65 was picked as the "sweet spot"
+(tied for best median, best mean, tightest regression tail) and carried
+forward as the leading candidate. A separate, more aggressive probe
+(futility scaled to 0.35x original, LMP to 0.45x — pushed further after an
+explicit "more aggressive" request) showed an even larger node reduction
+(24.1% median vs. baseline, 9.8% further reduction vs. the 0.65 candidate)
+but was set aside per direct user instruction to instead search the
+neighborhood around the already-promising 0.65-0.70 area rather than
+continue pushing toward the extreme.
+
+### Game-tested: negative at two different magnitudes, with no recovery at the lighter one
+
+Two 40-game sanity checks (`tc=8+0.08`, `-concurrency 4`, `-recover`,
+`openings.epd order=random`), each vs. the unmodified (RFP=100, LMR=1.675)
+baseline:
+
+| candidate | Score | Elo | LOS |
+|---|---|---|---|
+| 0.65x (futility+LMP together) | 41.25% (5W-12L-23D) | -61.43 ± 81.19 | 6.13% |
+| 0.85x (lighter touch, futility+LMP together) | 40.00% (4W-12L-24D) | -70.44 ± 64.26 | 1.27% |
+
+Neither result is the "wildly lopsided, ~90%-loss" pattern this project
+treats as an unambiguous bug signal — but both are a clear, consistent
+lean negative, and **the lighter-touch 0.85x candidate did not recover
+toward parity relative to 0.65x — if anything its point estimate was
+slightly worse, and its LOS dropped from 6.1% to 1.3% (i.e. higher, not
+lower, confidence that it's a real loss).** Two independent 40-game
+samples (different random opening draws each), at two different
+tightening magnitudes, both landing solidly negative without the expected
+"back off the aggressiveness and it gets better" pattern, is a real signal
+that tightening futility and LMP *together* costs more search quality
+than the node savings are worth in this range — not simply a matter of
+picking a gentler scale. Consistent with, and a concrete instance of, this
+document's own standing caution (first raised in the RFP=234→165 section
+above): a cheap node-count/firing-rate signal is not a reliable proxy for
+Elo when tightening forward-pruning margins — it must be game-tested
+before adopting, no matter how clean the node-count evidence looks.
+
+**Decision: reverted, not adopted.** `nnue_engine.cpp`'s `FUTILITY_MARGIN`
+and `LMP_MOVES` are back to their original, untouched values
+(`{0,100,200,300,400}` and the original depth-indexed LMP table). RFP
+remains at `100` (never touched this pass). `./nnue_engine` and
+`nnue_engine_baseline` were rebuilt fresh from this reverted state — both
+are byte-for-byte HEAD (`0ae1099`) again, i.e. this entire investigation
+ends as a no-op on the live/production binaries.
+
+**If this is revisited:** don't retry "tighten futility+LMP together" at
+some other single scale — two data points in this range already argue
+against that framing. The one untried, better-motivated next step
+(discussed but not run, since the session ended here) is to **isolate
+futility and LMP from each other** — tighten only one at a time at a
+moderate scale (e.g. 0.85x) and game-test each separately, since this
+session's two tests never separated the two mechanisms' individual
+contribution to the loss. It's possible one of them (not both) is the
+actual problem, or that the *combination* specifically is what costs
+strength even though neither alone would. `nodecount_sweep.py` and the
+`prunestats` candidate-scale instrumentation (both still in the repo) are
+ready to reuse for that without rebuilding any tooling.
+
+**Tooling kept from this session** (all additive, reusable, no effect on
+default engine behavior): `nodecount_sweep.py` (repo root) and
+`depth_nodecount_compare.py` (repo root) — the latter reconfirmed, on a
+larger and more careful re-run (150 real-game positions, `maxdepth=16`,
+sampled the same way as `prunestats`) than the small 20-position spot
+check that originally suggested an ever-compounding node-count gap, that
+**the node-count gap to Stockfish plateaus at roughly 3.5-4x from around
+nominal depth 10 onward rather than compounding without bound** — it looks
+"set" by around depth 6-10 and roughly flat after that. This corrects the
+earlier small-sample impression (up to 23-28x, still growing at depth 16)
+as noise-driven, not a real trend — re-run `depth_nodecount_compare.py`
+directly if exact per-depth numbers are needed again, they weren't
+preserved verbatim from this session's run.
+
+## Polyglot opening book: real UCI-level support, now the engine's standard book mechanism
+
+Earlier work (a prior session) added opening-book support only at the
+lichess-bot Python layer (`get_book_move()` called before any UCI `go`) —
+invisible to fastchess/UCI, so it could never be exercised by this
+project's own SPRT harness. The user asked directly for **"an actual
+measurement"** of the book's effect, which required building real
+Polyglot support into the engine's own UCI interface so fastchess could
+exercise it like any other engine feature.
+
+### What was built
+
+`nnue_engine.cpp` gained standard UCI `OwnBook` (`type check`, default
+`false`) and `BookFile` (`type string`) options, plus a `polyhash` debug
+command (mirrors the existing `eval` debug command). Implementation:
+
+- The full standard 781-entry Polyglot `POLYGLOT_RANDOM_ARRAY` (Fabien
+  Letouzey's original table), copied verbatim from python-chess's
+  `chess/polyglot.py`.
+- `polyglot_hash(Board)` — independently reimplements python-chess's
+  exact Zobrist scheme (per-piece entries, castling-rights entries, an
+  en-passant entry included only when a pawn can actually capture there —
+  not just because `ep_square` is set — and the side-to-move entry).
+  **Verified byte-exact against `chess.polyglot.zobrist_hash()` on 8 test
+  cases** (`verify_polyglot_hash.py`), including both-side castling rights
+  and the ep-square-set-but-not-actually-capturable edge case.
+- `load_polyglot_book(path)` — parses the standard 16-byte big-endian
+  entry format, sorted by key for binary search.
+- `probe_book(Board)` — binary search by key, weighted-random selection
+  among matching entries (uniform weights currently — no per-move
+  engine-strength bias yet, see the earlier opening-book section's
+  rationale for why), decodes the raw move and cross-checks it against
+  the position's actual legally generated moves to recover castle/ep/
+  promotion flags, returns "no move" defensively on any mismatch.
+- Book consult is gated identically to the existing timed-game branch in
+  the `go` handler (`wtime`/`btime` present, not `infinite`/`movetime`/
+  `go depth`/`go nodes`) — fixed-depth analysis and `go depth`/`movetime`
+  queries always search for real, matching how the lichess-bot Python
+  book only ever fired during real play.
+
+**One real bug found and fixed during this work**: the from/to square
+decode was initially backwards (`from = raw & 63; to = (raw>>6) & 63`,
+should be the reverse per python-chess's actual encoding) — this would
+have made the book silently non-functional, always falling through to
+search, despite the hash lookup itself working correctly. Caught by
+manual UCI testing (a book-covered position returned `bestmove 0000`
+instead of a real move) before it ever reached a sanity check or SPRT.
+
+**Second issue found and fixed**: the book's coverage stopped exactly at
+the same point `openings.epd`'s 49 FENs sit (both are generated from the
+same `LINES` dict in `gen_opening_book.py`), so any fastchess run started
+from `openings.epd` would fall out of book on the opponent's very first
+move — largely defeating the point of testing it in an SPRT context.
+Fixed by extending `build_polyglot_book.py` with an `EXTRA_CONTINUATIONS`
+dict (4-6 more half-moves of hand-typed theory per line, past
+`openings.epd`'s stopping point, `openings.epd`/`gen_opening_book.py`
+themselves untouched) and regenerating `lichess-bot/engines/book1.bin`
+(258 → 450 entries).
+
+**Verification**: `verify_book_coverage.py` drives the real engine binary
+over UCI and confirms, across all 403 book-covered positions spanning all
+49 lines, zero wrong/non-book moves and zero unexpectedly-slow
+(>50ms, i.e. fell through to search) responses — PASS. A direct check
+also confirmed all 49 `openings.epd` FENs now get an instant book
+response rather than falling out of coverage immediately.
+
+### Measurement: sanity-checked, not SPRT-resolved
+
+A 40-game sanity check (`tc=8+0.08`, `-concurrency 4`,
+`-openings file=openings.epd order=random`, book-enabled candidate vs.
+book-disabled baseline, otherwise identical binaries) completed cleanly —
+zero crashes/disconnects/illegal moves/timeouts — with **+8.69 ± 71.11
+Elo**, 9W-8L-23D, for the book-enabled side. This lands squarely inside
+the predicted "pure clock-banking" range (book moves are free against an
+8s clock, with no assumed opening-quality edge since move weights are
+uniform by design) and shows no red flags, but the error bars are far too
+wide at n=40 to call this a result on its own.
+
+**A real SPRT was launched to get an actual resolved number, then killed
+mid-run by explicit user interrupt ("okay stop") before any meaningful
+data accumulated.** No SPRT-confirmed Elo figure for the book exists. If
+one is wanted later, re-launch `nnue_engine` (OwnBook=true) vs.
+`nnue_engine_baseline` (OwnBook=false) at `elo0=0 elo1=10`,
+`tc=8+0.08`, `-openings file=openings.epd order=random`, `-recover` —
+same protocol as every other SPRT in this document.
+
+### Decision: shipped as the engine's standard book mechanism anyway
+
+Per explicit user instruction ("make the book UCI the new thing the
+engine uses and that's it"), the UCI-level book is now this project's
+standard book mechanism, adopted without waiting for the SPRT above to
+resolve — the sanity check showed no correctness risk (zero anomalies
+across 40 games) and the clock-banking rationale for a modest positive
+effect is sound even without a tight Elo number.
+
+- `./nnue_engine` and `nnue_engine_baseline` were both rebuilt from the
+  current `nnue_engine.cpp` (which now includes the book module) and are
+  otherwise unchanged from their prior state (LMR divisor 1.675, RFP 100,
+  Lazy SMP, all prior fixes) — `OwnBook` still defaults to `false` at the
+  UCI level (standard opt-in-by-`setoption` behavior, consistent with
+  every other option this engine exposes), so nothing about raw binary
+  behavior changed without an explicit `setoption`.
+- **`lichess-bot/config.yml`** (gitignored, documented here per this
+  project's standing convention for that directory): the old Python-layer
+  `polyglot.enabled` was flipped to `false` (it would otherwise silently
+  intercept every book move before the engine's own UCI book ever saw the
+  position — redundant now, not a second layer of defense), and
+  `uci_options` gained `OwnBook: true` / `BookFile: <absolute path to
+  book1.bin>` so the live lichess bot now sources book moves through the
+  engine's native UCI path instead.
+- `book_sanity_check.py` (the earlier session's Python-layer validator)
+  is left in the repo as a reference for that now-disabled code path, not
+  deleted — it still exercises real code (`lib.engine_wrapper`) that
+  remains in `lichess-bot/`, just no longer the active book route.
+
+### Files added this session
+
+`build_polyglot_book.py` (rewritten — `EXTRA_CONTINUATIONS`),
+`verify_polyglot_hash.py`, `verify_book_coverage.py`,
+`book_sanity_check.py` (restored after an accidental deletion mid-session
+— rewritten to note the now-superseded status of the Python-layer path
+it validates).
