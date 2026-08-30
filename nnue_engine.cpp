@@ -128,6 +128,45 @@ static constexpr int INSTABILITY_SCORE_DELTA = 20;  // cp; see iterate()'s
     // noisy a trigger on its own (fires on almost every real move once past
     // the book, see CLAUDE.md's bullet time-drain diagnosis), so also
     // require the score to have moved by at least this much.
+// Continuous instability-stretch dial (replaces a flat 1.3x-per-event
+// multiplier). A delta right at INSTABILITY_SCORE_DELTA gets the gentle end
+// of the range; only a delta at or beyond 4x that threshold reaches the
+// ceiling. The ceiling is intentionally *not* looser than the old flat
+// 1.3x by much -- CLAUDE.md documents the flat version as the direct cause
+// of clock-draining stretches on near-equal quiet-move label flips, so an
+// ordinary borderline event (delta close to the threshold) must end up
+// cheaper than before, not just smoother.
+static constexpr double INSTABILITY_STRETCH_MIN = 1.10;
+static constexpr double INSTABILITY_STRETCH_MAX = 1.35;
+// Falling eval: the score has declined for two consecutive completed
+// iterations (from the same d>=5 noise floor as the instability trigger)
+// even though the best move's label hasn't changed -- a softer, purely
+// score-based signal, so it gets a smaller single-shot stretch than a
+// genuine label-changing instability event.
+static constexpr int    FALLING_EVAL_DELTA    = 30;  // cp, cumulative over 2 iterations
+static constexpr double FALLING_EVAL_STRETCH  = 1.15;
+// Easy move ("dominant, stable-for-N-iterations move" variant) -- TRIED AND
+// REVERTED, don't re-add without new evidence. A same-label, quiet-score
+// (<15cp swings) run of 6 consecutive iterations past d=10 stopped
+// deepening early, mirroring Stockfish's obvious/forced-move fast exit.
+// 40-game isolation test (dial+falling-eval-only vs. baseline: 50.00%,
+// Elo 0.00 +/- 64.43, clean; same dial+falling-eval WITH this heuristic
+// added vs. baseline: 41.25%, Elo -61.43 +/- 76.99, LOS 5.21%) isolated a
+// real regression to this specific mechanism -- label-and-score stability
+// across a handful of iterations is evidently too weak a signal for
+// "nothing more to find here" on this engine; it fires on real, still-
+// contested middlegame positions (confirmed by hand: cut a genuine
+// middlegame search to 18% of its soft budget at depth 20). Stockfish's
+// real equivalent gates on root-move *node-share* dominance, which this
+// engine has no per-root-move instrumentation for (see CLAUDE.md's
+// "Node-mass-by-depth" and node-count-sweep precedents for why a cheap
+// proxy signal is not a reliable stand-in for a real game-tested one).
+// If revisited, that's the more promising version to build, not a re-tune
+// of these thresholds -- CLAUDE.md's RFP/futility/LMP tightening history
+// shows one-at-a-time threshold grid searches on a heuristic already shown
+// net-negative rarely recover it. The single-legal-move fast exit (see
+// iterate()) is unaffected by this and stays -- that one is safe by
+// construction, not a heuristic.
 [[maybe_unused]] static constexpr int RFP_MARGIN     = 120;
 
 static constexpr int FUTILITY_MARGIN[5] = {0, 100, 200, 300, 400};
@@ -2882,16 +2921,33 @@ struct Engine {
         Move pv[MAX_PLY];
         int  pv_len = 0;
 
-        // Best-move instability tracking: each time the best move changes
-        // between consecutive completed iterations (from a depth where that
-        // means something, not the noisy shallow depths), stretch the soft
-        // limit a bit — an unstable position is exactly when cutting the
-        // search short is most likely to return the wrong move. Always
-        // capped by the hard limit via out_of_time().
+        // Single-legal-move fast exit: nothing to decide, so don't spend
+        // any of the normal per-move budget on it. Only gated on
+        // soft_limit_ms >= 0 (real wtime/btime play), same convention as
+        // every other early-exit mechanism below — `go movetime`/`go
+        // depth`/`go infinite` always run their full requested budget.
+        // Computed once here rather than per-thread-differently: every
+        // thread (main and helpers) sees the same board and reaches the
+        // same conclusion independently, so no cross-thread coordination
+        // is needed for this specific case.
+        bool single_legal_move = false;
+        if (soft_limit_ms >= 0) {
+            Move root_moves_tmp[MAX_MOVES];
+            single_legal_move = (board.gen_moves(root_moves_tmp) == 1);
+        }
+
+        // Best-move instability / falling-eval tracking: both signals only
+        // ever adjust effective_soft — neither can push a search past the
+        // caller's hard_limit-derived out_of_time() check, and neither is
+        // active outside the soft_limit_ms >= 0 (wtime/btime) path. See the
+        // constant definitions above for what each one means.
         int64_t effective_soft = soft_limit_ms;
+        int score_prev1 = 0;  // score after the most recently completed iteration
+        int score_prev2 = 0;  // score after the iteration before that
 
         for (int d = 1; d <= depth; d++) {
             if (out_of_time()) break;
+            if (single_legal_move && d > 1) break;
             // Soft-limit early exit: once the normal allocation for this
             // move is used up and the line hasn't been unstable, don't
             // start another iteration. Only active for wtime/btime-derived
@@ -2941,22 +2997,50 @@ struct Engine {
             if (out_of_time() && d > 1) break;
 
             if (iter_pv_len > 0) {
-                // Instability: the best move changed from the previous
-                // completed iteration AND the score actually moved by a
-                // real margin, not just a label swap among near-equal
-                // moves (the latter fires on almost every move in quiet
-                // middlegame positions and was draining bullet clocks --
-                // see CLAUDE.md). Ignore the shallow depths, where this is
-                // just noise rather than a signal worth reacting to.
-                if (soft_limit_ms >= 0 && d >= 5 &&
-                    best_move != NO_MOVE && iter_pv[0] != best_move &&
-                    std::abs(score - best_score) >= INSTABILITY_SCORE_DELTA) {
-                    effective_soft = std::min(g_time_limit_ms,
-                                               (int64_t)(effective_soft * 1.3));
+                // Instability / falling-eval signals both read the same
+                // "how far did the score move" delta and the same "did the
+                // label change" fact — computed once, from the *previous*
+                // completed iteration's values (best_move / best_score),
+                // before either gets overwritten below. Ignore the shallow
+                // depths (d < 5), where all of this is just noise rather
+                // than a real signal (see CLAUDE.md's bullet time-drain
+                // diagnosis for why a bare label change is too noisy a
+                // trigger on its own).
+                if (soft_limit_ms >= 0 && d >= 5 && best_move != NO_MOVE) {
+                    bool label_changed = (iter_pv[0] != best_move);
+                    int  delta         = std::abs(score - best_score);
+
+                    if (label_changed && delta >= INSTABILITY_SCORE_DELTA) {
+                        // Continuous dial: a delta right at the threshold
+                        // gets the gentle end; only a delta at or beyond 4x
+                        // the threshold reaches the ceiling. See the
+                        // constant comments above for why the ceiling must
+                        // not be looser than the old flat 1.3x.
+                        double t = std::min(1.0,
+                            double(delta - INSTABILITY_SCORE_DELTA) / (4.0 * INSTABILITY_SCORE_DELTA));
+                        double mult = INSTABILITY_STRETCH_MIN +
+                                      t * (INSTABILITY_STRETCH_MAX - INSTABILITY_STRETCH_MIN);
+                        effective_soft = std::min(g_time_limit_ms,
+                                                   (int64_t)(effective_soft * mult));
+                    } else if (!label_changed &&
+                               score < score_prev1 && score_prev1 < score_prev2 &&
+                               score <= score_prev2 - FALLING_EVAL_DELTA) {
+                        // Falling eval: same best move, but the score has
+                        // declined for two full iterations running -- a
+                        // softer signal than a label change, so a smaller
+                        // single-shot stretch (not compounded with the
+                        // instability branch above; at most one of the two
+                        // fires per iteration).
+                        effective_soft = std::min(g_time_limit_ms,
+                                                   (int64_t)(effective_soft * FALLING_EVAL_STRETCH));
+                    }
                 }
+
                 best_move  = iter_pv[0];
                 best_score = score;
                 prev_score = score;
+                score_prev2 = score_prev1;
+                score_prev1 = score;
                 memcpy(pv, iter_pv, sizeof(Move) * iter_pv_len);
                 pv_len = iter_pv_len;
             }

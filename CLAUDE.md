@@ -2123,3 +2123,170 @@ before overwriting) — so both now include: the score-delta-gated
 instability stretch, the broadened book/movetime gate, and everything
 previously documented above (Lazy SMP, RFP=100, LMR divisor 1.675, native
 UCI Polyglot book, the original time-management overrun/low-clock fixes).
+
+## Stockfish-style time management: three mechanics added, one tried and reverted; a real `stop`/pondering bug found but not fixed
+
+Triggered by the user reporting that even blitz games (not just bullet)
+consistently drain most of the clock down to a small reserve, and asking
+directly how Stockfish manages time efficiently. Answered conceptually
+first (continuous stability/score-trend scaling instead of a binary
+trigger, an "obvious move" fast exit, pondering), then asked to implement
+all of it and verify carefully.
+
+### What was built
+
+`nnue_engine.cpp`'s `iterate()` (the per-move iterative-deepening loop) and
+its constants near `INSTABILITY_SCORE_DELTA` gained three mechanics, all
+gated on `soft_limit_ms >= 0` (i.e. only active for real wtime/btime play,
+same convention as every other early-exit in this function -- fixed
+`go movetime`/`go depth`/`go infinite` are unaffected):
+
+1. **Continuous instability-stretch dial** (`INSTABILITY_STRETCH_MIN=1.10`,
+   `INSTABILITY_STRETCH_MAX=1.35`) -- replaces the old flat 1.3x-per-event
+   multiplier with one scaled by how far the score actually moved. A delta
+   right at `INSTABILITY_SCORE_DELTA` gets the gentle end; only a delta at
+   or beyond 4x that threshold reaches the ceiling. Deliberately built so
+   an ordinary borderline event ends up *cheaper* than the old flat 1.3x,
+   not just smoother -- CLAUDE.md already documents the flat version as
+   the direct cause of clock-draining stretches on near-equal quiet-move
+   label flips, so a "refinement" that stretches more on average would be
+   a regression dressed up as one.
+2. **Falling-eval extension** (`FALLING_EVAL_DELTA=30`,
+   `FALLING_EVAL_STRETCH=1.15`) -- extends thinking time when the score has
+   declined for two consecutive completed iterations even though the best
+   move's label hasn't changed, mirroring Stockfish's real behavior (which
+   reacts to a worsening trend, not just a label flip). Softer signal than
+   a label change, so a smaller single-shot stretch; the two mechanics
+   don't compound in the same iteration (at most one fires per iteration).
+3. **Single-legal-move fast exit** -- computed once per `iterate()` call
+   (every thread, main and helpers, reaches the same conclusion
+   independently since they see the same board, so no cross-thread
+   coordination is needed for this specific case): if there's exactly one
+   legal move, run one depth-1 search for a real score/PV, then stop.
+   Verified: a real forced-move test position (`7k/8/8/8/8/8/6Q1/6RK b - -
+   0 1`, one legal move) went from what would have been a ~2000ms
+   allocation to 0ms, correct move returned.
+
+### Tried and reverted: the fourth mechanic ("obvious move" stability-based fast exit)
+
+A fourth mechanic, closer to Stockfish's actual "obvious/forced move" fast
+exit, was also built and isolation-tested: track `stable_iters` (consecutive
+completed iterations, from the same `d>=5` noise floor as the instability
+trigger, where the best move's label didn't change AND the score moved by
+less than `EASY_MOVE_QUIET_DELTA=15`cp); once `stable_iters` reached 6 at
+`d>=10`, stop deepening immediately and signal `g_stop` (required --
+without it, a helper thread's independent `effective_soft` means
+`search()`'s `pthread_join` would still block on whichever helper takes
+longest, and the main thread's early exit alone saves zero wall-clock
+time).
+
+**Isolated via a controlled A/B, not just a single combined test** (per
+this project's own precedent -- "don't retry tighten-X-and-Y-together;
+isolate them", from the futility+LMP episode below): a 40-game sanity
+check with all four mechanics active scored 41.25% vs. baseline (Elo
+-61.43 +/- 76.99, LOS 5.21%); an otherwise-identical 40-game run with only
+this fourth mechanic disabled (same dial + falling-eval + single-legal-move)
+scored a clean 50.00% (Elo 0.00 +/- 64.43). This isolates the regression
+to this one mechanism specifically, not the other three. Confirmed by hand
+too: it cut a genuine, still-contested middlegame search
+(`r2q1rk1/ppp2ppp/2np1n2/2b1p3/2B1P1b1/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 4 8`)
+to just 18% of its allotted soft budget (depth 20/544ms vs. an effective
+soft limit that had grown to ~3034ms) purely because the label+score had
+looked "settled" for 6 iterations -- evidently too weak a signal on this
+engine; Stockfish's real equivalent gates on root-move *node-share*
+dominance, which this engine has no per-root-move instrumentation for.
+**Reverted, not re-tuned** -- consistent with this project's RFP/futility/
+LMP tightening history, where one-at-a-time threshold grid searches on an
+already-shown-negative heuristic rarely recover it. The dead constants and
+logic are removed from `nnue_engine.cpp`; a comment at the `RFP_MARGIN`
+declaration site records the isolation-test numbers and the node-share
+alternative for anyone revisiting this.
+
+### Real, unrelated bug found: `go infinite` + `stop` does not work at all
+
+While scoping out whether to also implement pondering, found (and
+reproduced directly, not inferred) that **the UCI main loop cannot process
+a `stop` command while a search is in flight.** `main()`'s loop is
+`while (std::getline(std::cin, line))` -- fully synchronous, one line
+processed to completion (including blocking inside `engine.search()`)
+before the next line is even read. Sent `go infinite` immediately followed
+by `stop` by hand: the engine kept iterating past depth 19 and had to be
+force-killed; it never once reads the `stop` line because the loop is
+still blocked inside the first `go`'s `search()` call, which for
+`go infinite` (`hard_limit=-1`, so `out_of_time()`'s time check never
+trips) only terminates by reaching `depth=64`, i.e. effectively never in a
+real position. This is also the actual architectural prerequisite for
+pondering (which needs the engine to keep searching in the background
+while remaining responsive to `stop`/`ponderhit`) -- not implemented this
+session, deliberately scoped out (see below).
+
+**Not fixed this session.** A correct fix means running `search()` on a
+background thread from the `go` handler and having the main loop keep
+reading stdin concurrently, which collides with a documented invariant
+elsewhere in this file: `g_start_time`/`g_time_limit_ms`/`g_soft_limit_ms`
+are "set once before any worker is launched, then read-only for the
+duration of the search" -- true today because nothing hands the main
+thread control back until the whole search (all helpers included) is
+done. A real fix needs to preserve thread-safety for that invariant
+(making `g_time_limit_ms`/`g_soft_limit_ms` atomic is the likely fix,
+since `out_of_time()`'s hot-path read is already gated behind a
+once-per-4096-nodes check -- negligible cost either way) and design
+`ponderhit`'s semantics (convert an in-flight infinite ponder search into
+a real time-managed one without restarting it and losing the work already
+done). Flagged to the user as a separate, larger, higher-risk follow-up;
+not started.
+
+### Verification and deployment
+
+Verified directly (not inferred) that neither new stretch mechanism can
+violate the hard cap: hand-fed `NNUE_TIME_DEBUG=1` at bullet-shaped low
+`wtime` values (100/200/500/1000/60000ms) showed 0-1ms overrun throughout
+-- the same noise floor this project already treats as clean (see the
+original time-management-overrun section above). `search_wall` was also
+confirmed to actually drop on both the single-legal-move case (0ms) and
+a real endgame position that settled quickly (8ms, was previously
+projected to spend up to the full ~2000ms soft budget) -- i.e. the
+`g_stop`-on-early-exit signaling actually saves wall-clock time across
+threads, not just on the reporting thread.
+
+**Elo signal at this project's `tc=8+0.08` fastchess anchor: flat, not
+resolved as a win.** Two 40-game sanity checks plus a real SPRT
+(`elo0=0 elo1=10`) totaling ~1050 games (stopped by explicit user request
+at 978 games, never crossed either LLR bound) all landed within noise of
+50% -- final tally 49.08% / approx -6.4 Elo. Zero crashes, zero time
+losses, zero lopsided results across the entire ~1050 games, including the
+SPRT's real games, which (worth being precise about, since this was
+initially mis-stated mid-session) **were genuine full games played through
+a live, continuously-decrementing UCI clock from move 1 to the end**
+(fastchess sends real `wtime`/`btime`, same protocol path lichess-bot
+uses) -- not a fixed-movetime or truncated test. `tc=8+0.08` is in fact
+*faster* than real lichess bullet, so if anything these games hit low-clock
+territory sooner than a real 60s+ bullet game would. **Do not repeat the
+mid-session claim that this anchor "structurally can't see this class of
+fix"** -- that reasoning is validly documented elsewhere in this file for
+two *other*, narrower bugs (the `myTime/2` safety-cap defeat, lichess-bot's
+first-move `movetime` bypass) with specific, verified trigger conditions
+that really don't occur at this tc; it does not automatically transfer to
+general time-allocation-shape changes like these three, and restating it
+without re-verifying was a mistake caught only because the user asked a
+direct, specific question about the test methodology. The defensible
+reading of the flat result: either these three mechanics have a genuinely
+small net effect at this specific (very fast) speed, or a real small
+effect is under-resolved at ~1050 games -- this project's own
+`CHECK_EXT_BUDGET=24` precedent took ~1660 games to fully resolve a
+small effect down to noise, so 1050 games is not dispositive either way.
+
+**Deployed anyway, on safety + direct verification, not an Elo claim** --
+same category of decision as the original low-clock/overrun time fixes and
+the Polyglot book: zero regressions/crashes/time-losses across every test
+run, the underlying logic independently hand-verified correct, and the
+change directly targets a real, user-reported problem (clock draining to a
+small reserve) that a fast fixed-tc anchor is, at minimum, not positioned
+to rule out helping with even if it can't confirm it here. `./nnue_engine`
+and `nnue_engine_baseline` were both rebuilt from this state (no
+`lichess-bot` process running at the time, confirmed via `ps aux` first)
+-- both now include the three mechanics above on top of everything
+previously documented in this file. If a tighter Elo answer is wanted
+later, a real bullet/blitz time control closer to what the lichess bot
+actually plays (not `tc=8+0.08`) is a more direct test than re-running
+this same anchor.
