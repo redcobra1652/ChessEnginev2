@@ -2290,3 +2290,124 @@ previously documented in this file. If a tighter Elo answer is wanted
 later, a real bullet/blitz time control closer to what the lichess bot
 actually plays (not `tc=8+0.08`) is a more direct test than re-running
 this same anchor.
+
+## UCI_Elo bisection: engine strength lands at ~2900 on the `tc=8+0.08` anchor -- but this number is disputed, not final
+
+Triggered by the user directly challenging two things at once: (1) whether
+comparing this engine against **unlimited, full-strength** Stockfish 18
+(dropping `UCI_LimitStrength` entirely, as briefly considered) would give a
+useful number, and (2) later, whether the whole `tc=8+0.08` anchor is even
+an accurate test given how fast it is, and why it disagrees with the live
+lichess bot's own measured ~2600 rating.
+
+### Why full-strength Stockfish was ruled out before testing it
+
+Reasoned, not measured (no games were run against unlimited SF18): any
+opponent 400+ Elo above the true rating produces a score statistically
+indistinguishable from an opponent 1000+ Elo above it, because the
+logistic Elo score curve saturates near 0% well before the gap gets that
+large. A near-100% loss rate against full-strength SF18 (rated 3600+)
+would confirm "much weaker" and nothing more precise than that -- it
+cannot distinguish a true rating of 2900 from a true rating of 2000. An
+Elo estimate needs an opponent *close* to the engine's own level, which is
+exactly what `UCI_LimitStrength`/`UCI_Elo` at a chosen target provides.
+
+### Method: bisect `UCI_Elo` upward from the existing 2750 anchor point
+
+The existing anchor table at the top of this document already had one
+real, non-degenerate data point: `UCI_Elo=2750`, 58.75% score (200 games),
++61.43 +/- 42.49 Elo -- i.e., this engine is confirmed stronger than 2750
+on this scale. Rather than pick a single new target and hope it's close,
+the right move (and the standard way rating lists actually work) is to
+walk `UCI_Elo` upward until the score falls back toward ~50% -- that
+crossing point is the real estimate. Confirmed the bundled Stockfish's
+usable range first: `UCI_Elo min=1320 max=3190`.
+
+Ran one rung at `UCI_Elo=2900`: `nnue_engine` at its real deployed
+configuration (Threads=4, Hash=512, `OwnBook=true` with the real
+`book1.bin`, matching `lichess-bot/config.yml` exactly) vs. Stockfish 18
+(`UCI_LimitStrength=true UCI_Elo=2900`, Threads=1, Hash=64), same
+`tc=8+0.08 timemargin=200` anchor TC, 50 games, `-concurrency 2`,
+`openings.epd order=random`, `-recover`. Zero crashes/disconnects/time
+losses across the full run (grepped the log for all of those, no matches).
+
+**Result: 20W-21L-9D, 49.00% score, Elo -6.95 +/- 93.56, LOS 44.07% --
+statistically dead even.** Combined with the existing 2750 point:
+
+| `UCI_Elo` target | Score | Elo |
+|---|---|---|
+| 2750 | 58.75% (200 games) | +61.43 +/- 42.49 |
+| **2900** | **49.00% (50 games)** | **-6.95 +/- 93.56** |
+
+Comfortably above 2750, statistically even at 2900 -- the crossing point,
+and this project's best current strength estimate on this anchor, is
+**~2900**, not the previously-unset "~3000 goal."
+
+**A live example of this project's own standing caution, observed while
+this exact rung was still running:** the in-progress read at n=31 games
+was 41.9% / -56.5 Elo (looked like a clear loss); by n=50 it had swung all
+the way to 49.00% / -6.95 (dead even). Another instance of "don't trust a
+mid-run number," this time caught and flagged in real time rather than
+after the fact.
+
+### Why ~2900 should not be trusted as a precise or final number
+
+Raised directly by the user, and the concerns are valid, not just
+hand-wringing:
+
+1. **`tc=8+0.08` is an 8-second-per-side anchor, chosen for cheap
+   iteration, not for realism.** Three concrete reasons this specific
+   test undermines an absolute strength claim:
+   - `UCI_LimitStrength` is already documented elsewhere in this file to
+     **under-limit Stockfish at fast time controls** -- so the "2900"
+     label itself is less trustworthy exactly at this speed, likely
+     playing a bit stronger than a real 2900 would.
+   - Fixed per-move overhead (process/IPC, movegen setup, book lookup, TT
+     bookkeeping) eats a much bigger fraction of an 8-second budget than a
+     60+-second one -- more noise relative to signal.
+   - Every real low-clock bug this project has found and fixed this
+     session and earlier ones (the `myTime/2`-then-`/4` safety-cap
+     defeat, lichess-bot's first-move `movetime` book-bypass, the
+     instability-stretch overspend) only manifests as a real clock runs
+     down over dozens of moves -- **none of them can ever trigger in an
+     8-second game**, so this anchor structurally cannot confirm whether
+     those fixes are doing anything in the regime they were built for.
+2. **This ~2900 number disagrees with the live lichess bot's own measured
+   ~2600 rating, and the gap is not yet explained.** Candidate causes,
+   none yet tested:
+   - TC mismatch: the lichess bot plays real `60+1`/`60+2`/`180+1`/`180+2`
+     (`lichess-bot/config.yml`'s `challenge_initial_time`/
+     `challenge_increment`), not `8+0.08` -- a completely different
+     regime, and the one that actually exercises the low-clock code paths
+     above.
+   - **`UCI_Elo=X` and lichess's own Glicko-2 rating are not the same
+     scale even at matched TC** -- one is Stockfish's internal
+     self-declared handicap curve against a single fixed opponent; the
+     other is earned against a live, differently-calibrated pool of
+     humans/bots, and may itself carry a high rating deviation if the bot
+     account hasn't played many rated games yet (not checked this
+     session -- worth confirming game count/RD on the bot's lichess
+     profile before treating 2600 as more final than 2900).
+   - Real lichess games pay real network round-trip latency per move that
+     a local `fastchess` match never pays at all (`lichess-bot`'s
+     `move_overhead` setting exists specifically to compensate for this)
+     -- one more clock cost the `8+0.08` anchor cannot see.
+
+**Recommended next step, not yet run:** repeat this same `UCI_Elo`
+bisection at the lichess bot's actual real time controls (`60+1`/`60+2`
+bullet, and separately `180+1`/`180+2` blitz), same real-deployment
+engine config vs. Stockfish Threads=1. If the estimate drops toward ~2600
+at matched TC, that points to TC/under-limiting as the main driver of the
+gap. If it stays near ~2900 even at matched TC, that points instead to
+the lichess-rating-pool/network-latency/RD side, and the bot's actual
+game count and rating deviation should be checked before trusting 2600 as
+a stable number either. Real `60+1` games will run far longer per game
+than `8+0.08` (a 50-game batch could take 30-60+ minutes rather than the
+~11 minutes the 2900 rung took) -- budget for that before launching it.
+
+**Bottom line: ~2900 is this project's best current estimate on the
+`tc=8+0.08` anchor specifically, not a confirmed absolute rating.** Both
+the fast-TC caveat and the unexplained gap against the live ~2600 lichess
+number should travel with this figure any time it's cited -- don't repeat
+it as a settled "the engine is 2900" claim without those two caveats
+attached.
